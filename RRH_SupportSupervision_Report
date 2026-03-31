@@ -1,0 +1,3812 @@
+pacman::p_load(
+  rio,        # importing data  
+  here,       # relative file pathways  
+  janitor,    # data cleaning and tables
+  lubridate,  # working with dates
+  matchmaker, # dictionary-based cleaning
+  epikit,     # age_categories() function
+  tidyverse,   # data management and visualization,
+  kableExtra,  # Build and manipulate complex tables
+  scales,       # easily convert proportions to percents  
+  flextable,     # converting tables to pretty images
+  gtsummary,    # summary statistics and tests
+  rstatix,      # summary statistics and statistical tests
+  officer,        # helper functions for tables
+  parsedate,
+  knitr,
+  sf,
+  pandoc,
+  openxlsx,
+  dplyr,
+  stringr,
+  fuzzyjoin)
+
+#######################################################################
+#### Functions ####
+#### shading columns depending on value 
+#### set the target coloring
+
+RctTAT_color   <-  function(column_data){
+  ifelse(column_data <= 7, "green",
+         ifelse(column_data > 8 & column_data <= 14, "yellow","red"))
+}
+# followed by code like this
+### List Columns to Apply Coloring
+columns <- c("Jan-Mar", "Oct-Dec")
+
+### Apply Background Color ###
+for (col in columns) {
+  tble_HtimelyRct  <-   tble_HtimelyRct %>% 
+    bg(j = col, bg = RctPct_color(Hub_timelyRct[[col]]), part = "body")
+}
+#### fix timelines to dates ####
+#### Define the inputs
+clean_deadlines <- function(x, 
+                            ref_date = Sys.Date(),
+                            fy_start_month = 7,   # Uganda FY often starts July
+                            fy_end_month   = 6,   # ends June
+                            month_deadline = c("last_day", "first_day")) {
+  
+                  month_deadline <- match.arg(month_deadline)
+  
+# --- helper function ----
+# String inputs : Takes an input, s and returns cleaned output
+  fix_text <- function(s) {   
+    s %>%     # take the string through multiple cleaning sessions 
+      str_to_lower() %>%
+      str_replace_all("\\s+", " ") %>% # Remove extra spaces (one or more), remain with single space
+      str_trim() %>%
+      # common noise words/punctuation
+      str_replace_all("[,\\.]+", " ") %>%       # remove punctuation noise, e.g., ",", "."
+      str_replace_all("\\(.*?\\)", " ") %>%     # removes anything inside parentheses. ("6 months (June 2025)" → "6 months")
+      str_replace_all("^by\\s+", "") %>%        # remove leading "By "
+      str_replace_all("end of\\s+", "end ") %>%
+      # fix common typos / OCR-ish errors
+      str_replace_all(c(
+        "ausust" = "august",
+        "s0th"   = "30th",       # S0TH SEPT 2025
+        "jun"    = "june",
+        "sept"   = "september"
+      )) %>%
+      # remove ordinal suffixes: 15th -> 15
+      str_replace_all("(?<=\\d)(st|nd|rd|th)", "") %>% # look-behind: “only match if preceded by a digit” - 15th Ausust 2025
+      # normalize separators
+      str_replace_all("[/\\-]", " ") %>% # replaces /, - 
+      str_replace_all("\\s+", " ") %>%  #Earlier steps may introduce new spaces.: Collapse repeated spaces (again)
+      str_trim()
+  }
+  
+  parse_exact_date <- function(s) {    # a small helper function that is the “date interpreter” for anything that looks like a real calendar date.
+    # tries many orders: "27/03/2025", "30 march 2025", "1 june 2026", etc.
+    parse_date_time(   # a stronger version of as.Date
+      s,
+      orders = c("d m Y", "d b Y", "d B Y", "Y m d", "Y b d", "Y B d"), # try all orders until one works
+      exact = FALSE,
+      quiet = TRUE
+    ) %>% as.Date()
+  }
+  
+  parse_month_year <- function(s) {
+    # e.g., "dec 2025", "june 2025", "september 2025"
+    dt <- parse_date_time(s, orders = c("b Y", "B Y"), quiet = TRUE)
+    if (is.na(dt)) return(as.Date(NA))
+    d <- as.Date(dt)
+    if (month_deadline == "first_day") return(floor_date(d, "month"))
+    ceiling_date(d, "month") - days(1)  # last day of month
+  }
+  
+  parse_duration <- function(s) {
+    # number words -> digits
+    s2 <- s %>%
+      str_replace_all("\\bone\\b", "1") %>%
+      str_replace_all("\\btwo\\b", "2") %>%
+      str_replace_all("\\bthree\\b", "3") %>%
+      str_replace_all("\\bfour\\b", "4") %>%
+      str_replace_all("\\bsix\\b", "6")
+    
+    # months / years
+    n <- suppressWarnings(as.integer(str_match(s2, "(\\d+)\\s*(month|months|year|years)")[,2]))
+    unit <- str_match(s2, "(\\d+)\\s*(month|months|year|years)")[,3]
+    
+    if (is.na(n) || is.na(unit)) return(as.Date(NA))
+    if (str_detect(unit, "year"))  return(as.Date(ref_date %m+% years(n)))
+    if (str_detect(unit, "month")) return(as.Date(ref_date %m+% months(n)))
+    as.Date(NA)
+  }
+  
+  parse_fy <- function(s) {
+    # "2025/2026 fy", "2025/26 fy", "2025 2026"
+    m <- str_match(s, "(20\\d{2})\\s*(?:/|\\s)\\s*(\\d{2,4})")
+    if (any(is.na(m))) return(as.Date(NA))
+    
+    y1 <- as.integer(m[,2])
+    y2raw <- m[,3]
+    y2 <- ifelse(nchar(y2raw) == 2, as.integer(paste0(substr(y1,1,2), y2raw)), as.integer(y2raw))
+    
+    # return FY end date (customizable)
+    # FY ending month (e.g., June) -> end day of that month
+    end_date <- as.Date(sprintf("%d-%02d-01", y2, fy_end_month)) %>%
+      ceiling_date("month") %>%
+      { . - days(1) } %>%
+      as.Date()
+  }
+  
+  parse_qtr <- function(s) {
+    # "by end of qtr 2" / "end qtr 2"
+    q <- suppressWarnings(as.integer(str_match(s, "qtr\\s*(\\d)")[,2]))
+    if (is.na(q) || q < 1 || q > 4) return(as.Date(NA))
+    
+    # pick the next applicable fiscal-year quarter end from ref_date
+    # Fiscal year starts fy_start_month
+    y <- year(ref_date)
+    fy_start <- as.Date(sprintf("%d-%02d-01", ifelse(month(ref_date) >= fy_start_month, y, y-1), fy_start_month))
+    q_end <- fy_start %m+% months(3*q)  # start of next quarter
+    q_end <- as.Date(q_end - days(1))   # end of quarter
+    
+    # if already past, move to next FY
+    if (q_end < ref_date) {
+      fy_start2 <- fy_start %m+% years(1)
+      q_end <- as.Date((fy_start2 %m+% months(3*q)) - days(1))
+    }
+    q_end
+  }
+  
+  is_status <- function(s) str_detect(s, "^(completed|ongoing|monthly|long term plan|immediate)") ||
+    str_detect(s, "when .*available|based on availability")
+  
+  # --- main ----
+  raw <- x
+  txt <- fix_text(x)
+  
+  # classify
+  type <- case_when(
+    is.na(raw) ~ "missing",
+    is_status(txt) ~ "status_or_condition",
+    str_detect(txt, "^\\d{1,2}\\s+[a-z]+\\s+20\\d{2}$") ~ "exact_date",
+    str_detect(txt, "^20\\d{2}\\s+\\d{1,2}\\s+\\d{1,2}$") ~ "exact_date",
+    str_detect(txt, "^(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|september|oct|october|nov|november|dec|december)\\s+20\\d{2}$") ~ "month_year",
+    str_detect(txt, "qtr\\s*[1-4]") ~ "quarter",
+    str_detect(txt, "20\\d{2}\\s*(/|\\s)\\s*\\d{2,4}\\s*(fy)?") ~ "fiscal_year",
+    str_detect(txt, "\\b(\\d+|one|two|three|four|six)\\s*(month|months|year|years)\\b") ~ "duration",
+    TRUE ~ "other_text"
+  )
+  
+  # parse to due_date
+  due_date <- case_when(
+    type == "exact_date" ~ parse_exact_date(txt),
+    type == "month_year" ~ parse_month_year(txt),
+    type == "duration" ~ parse_duration(txt),
+    type == "fiscal_year" ~ parse_fy(txt),
+    type == "quarter" ~ parse_qtr(txt),
+    TRUE ~ as.Date(NA)
+  )
+  
+  # flag invalid calendar dates (e.g., "30 feb 2025" will become NA but we can mark it)
+  invalid_date_flag <- type %in% c("exact_date") & is.na(due_date) & !is.na(raw)
+  
+  tibble(
+    raw = raw,
+    cleaned_text = txt,
+    type = type,
+    due_date = due_date,
+    invalid_date_flag = invalid_date_flag
+  )
+}
+
+########################################################################
+###Importing Databases####
+Regions       <- import("D:/R works/CPHL_Lab/CPHL_Data/Databases/Regions.xlsx")
+RRH_Hubs      <- import("D:/R works/CPHL_Lab/CPHL_Data/Databases/NSRTN/RRH_Hubs.xlsx")
+
+TB_unique     <- import("D:/R works/CPHL_Lab/CPHL_Data/Databases/POC/TB_unique_sites.xlsx")
+TB_unique$HFacility <- toupper(TB_unique$HFacility)
+
+modules       <-  import("D:/R works/CPHL_Lab/CPHL_Data/Databases/POC/GeneXpert sites - 2024 Dec.xls")
+POC_Sites     <- import("D:/R works/CPHL_Lab/CPHL_Data/Databases/POC/POC_List(field).xlsx")
+dhis2names    <-  import("D:/R works/CPHL_Lab/CPHL_Data/Databases/POC/dhis2names.xlsx")
+gxp_error     <-  import("D:/CPHL-MOH/M&E/Databases & Lists/GxP error rates.xlsx")
+gxp_error$`Error Code`  <-  as.character(gxp_error$`Error Code`)
+
+mPima_error   <-  import("D:/CPHL-MOH/M&E/Databases & Lists/mPima_error classification.xlsx")
+mPima_error$Error_Code  <-  as.character(mPima_error$Error_Code)
+
+IP            <-  import("D:/R works/CPHL_Lab/CPHL_Data/Databases/POC/Districts, Regions, IP-IM.xlsx")
+testHF    <-  import("D:/R works/CPHL_Lab/CPHL_Data/Databases/HF_test.xlsx")
+master    <-  import("D:/R works/CPHL_Lab/CPHL_Data/Databases/Health Facility Master File.xlsx"
+)
+#######################################################################
+#### Import data sets ####
+SS25  <-import("D:/CPHL-MOH/Support Supervision/2026/SS_2025_26Datasets/SS_26MarchVersion.xlsx")
+#############################################################################
+#### cleaning the data set ####
+#### removing the columns not to be used in the analysis
+SSW   <- SS25 %>% 
+  select(-c(8:92))
+
+SSW   <- SS25 %>% 
+  select(-c(3))
+
+#### Capitalize the District names and input the RRH names
+SSW$District   <-  toupper(SSW$District) 
+SSW$LEVEL      <-  toupper(SSW$LEVEL)
+SSW$`FACILITY NAME`  <-  toupper(SSW$`FACILITY NAME`)
+
+#### triming 
+SSW$District <- trimws(SSW$District)
+
+
+#### cleaning the district names
+SSW  <-   SSW %>% 
+  mutate(District    =  recode(District,
+                               # Old               # New
+                               "KANUGU"       =    "KANUNGU",
+                               "LUWEERO"      =     "LUWERO",
+                               "KASESES"      =     "KASESE",
+                               "HOIMA DISTRICT"   =  "HOIMA",
+                               "MASINDI DISTRICT"   =   "MASINDI",
+                               "10-APRIL-2025."     =  "GOMBA",
+                               "BUTALEJA DISTRICT"  =  "BUTALEJA",
+                               "LWENGO DISTRICT"    =  "LWENGO",
+                               "PAPER DISTRICT"     =  "PADER",
+                               "KAPELOBYONG"        =  "KAPELEBYONG",
+                               "GOMBE"              =   "GOMBA",
+                               "NGORAH"             =  "NGORA",
+                               "LWENGO DISTRICT."   =  "LWENGO"
+                                 ))
+
+#### Add the RRH
+SSW  <-   SSW %>% 
+  left_join(Regions, by = "District")
+
+
+#### Removing columns not of interest
+SSW  <-   SSW %>% 
+  select(-c(7:91))
+
+
+#### renaming the some column names for demographics section
+SSW  <-   SSW %>%
+  rename(
+    # new          # Old
+    "VDate"   =   "Date of  visit",
+    "HFacility"   =  "FACILITY NAME"
+  )
+
+#### Adding the month and quarter to the date
+SSW  <-   SSW %>% 
+  mutate(
+    Yr  =  year(VDate),
+    Month =  month(VDate)
+  ) 
+
+# Add quarter, "Qtr"
+SSW  <-   SSW %>% 
+  mutate(
+    Qtr  =  case_when(
+      Month  %in% c(10, 11, 12) ~ "Oct-Dec",
+      Month   %in% c(1,2,3)     ~ "Jan-Mar",
+      Month  %in%   c(4,5,6)     ~ "Apri-Jun",
+      Month  %in%  c(7,8,9)      ~ "Jul-Sept"
+    ))
+
+# making years character
+SSW$Yr  <-  as.character(SSW$Yr)
+
+# checking for missing RRH
+SSWwewe  <- SSW %>% 
+  filter(is.na(RRH))
+
+######################################################################
+#### Report - demographics of visits ####
+sitesDash  <-  SSW %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH,Yr) %>% 
+  summarise(
+    No.SitesVisited  =  n_distinct(HFacility),
+    .groups = "drop"
+  ) %>% 
+  bind_rows(
+    summarise(
+      .,
+      across(where(is.numeric), ~ sum(.x, na.rm = TRUE))
+    ) %>% 
+      mutate(RRH = "NATIONAL",
+             Yr  =  "2026") %>% 
+      select(RRH, everything())
+  ) %>% 
+  select(RRH, No.SitesVisited)
+
+#### No. of sites visited by level by RRH ####
+sitesDashlvl  <-  SSW %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH,LEVEL, Yr) %>% 
+  summarise(
+    No.SitesVisited  =  n_distinct(HFacility),
+    .groups = "drop"
+  ) %>% 
+  bind_rows(
+    summarise(
+      .,
+      across(where(is.numeric), ~ sum(.x, na.rm = TRUE))
+    )     %>% 
+      mutate(RRH = "NATIONAL",
+             LEVEL =  "NATIONAL",
+             Yr  =  "2026") %>% 
+      select(RRH,LEVEL, everything())
+  ) %>% 
+  select(RRH, LEVEL, No.SitesVisited)
+
+#### No. of sites visited by level - all ####
+sitesDashlv2  <-  SSW %>% 
+  filter(Yr == "2026") %>% 
+  group_by(LEVEL, Yr) %>% 
+  summarise(
+    No.SitesVisited  =  n_distinct(HFacility),
+    .groups = "drop"
+  ) %>% 
+  bind_rows(
+    summarise(
+      .,
+      across(where(is.numeric), ~ sum(.x, na.rm = TRUE))
+    )     %>% 
+      mutate(LEVEL =  "NATIONAL",
+             Yr  =  "2026") %>% 
+      select(LEVEL, everything())
+  ) %>% 
+  select(LEVEL, No.SitesVisited)
+
+#### Data : No of sites by level ####
+# Total
+TtlNat <- sitesDashlv2 %>% 
+  filter(LEVEL == "NATIONAL")
+
+### number of RRH sites
+TotalSts <- TtlNat %>% 
+  pull(`No.SitesVisited`)
+
+# RRH
+RRHSites <- sitesDashlv2 %>% 
+  filter(LEVEL == "RRH") %>% 
+  summarise(RRH = sum(No.SitesVisited, na.rm = TRUE))
+
+### number of RRH sites
+RRHSts <- RRHSites %>% 
+  pull(RRH)
+
+# GH
+GHSites <- sitesDashlv2 %>% 
+  filter(LEVEL == "HOSPITAL") %>% 
+  summarise(HOSPITAL = sum(No.SitesVisited, na.rm = TRUE))
+
+### number of GH sites
+GHSts <- GHSites %>% 
+  pull(HOSPITAL)
+
+# HC IV
+HCIVSites <- sitesDashlv2 %>% 
+  filter(LEVEL == "HC IV") %>% 
+  summarise(HCIV = sum(No.SitesVisited, na.rm = TRUE))
+
+### number of HC IV sites
+HCIVSts <- HCIVSites %>% 
+  pull(HCIV)
+
+
+# HC III
+HCIIISites <- sitesDashlv2 %>% 
+  filter(LEVEL == "HC III") %>% 
+  summarise(HCIII = sum(No.SitesVisited, na.rm = TRUE))
+
+### number of HC III sites
+HCIIISts <- HCIIISites %>% 
+  pull(HCIII)
+
+######################################################################
+######################################################################
+#### HR####
+#### Report - National: %age of sites with the required cadres ####
+hroverall   <-  SSW %>% 
+  filter(Yr == "2026") %>% 
+  summarise(
+    Indicator    =  "%age of sites with the required lab cadres in place", 
+    No.sites     =  n_distinct(HFacility),
+    ReportedSites  =  sum(`The facility possesses all the required cadre categories (See attachment)` %in% c("Y","P"))
+  ) %>% 
+  mutate(
+    `%age of sites`  = round((ReportedSites/No.sites)*100,0) 
+  )
+
+#### Report - Proportion of required cadres in labs by RRH ####
+#### summarise the data set
+HRSSw   <-   SSW %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH,Yr) %>% 
+    summarise(
+      No_sites    =  n_distinct(HFacility),
+      Required_Cadres  = sum(`The facility possesses all the required cadre categories (See attachment)` == "Y", na.rm = TRUE),
+      Inadequate_Cadres  = sum(`The facility has required cadres, but, in inadequate numbers in the health facility` == "Y", na.rm = TRUE),
+      .groups = "drop"
+    )
+
+#### re-organise the data frame
+HRSSwPvt   <-  HRSSw %>% 
+  filter(Yr == "2026") %>% 
+  pivot_wider(
+    names_from = Yr,
+    values_from = c(No_sites, Required_Cadres, Inadequate_Cadres)
+     )%>% 
+   mutate(
+    `%age labs with required cadres` =  paste0(
+      round((Required_Cadres_2026 / No_sites_2026) * 100, 0), "% (",
+      Required_Cadres_2026, "/", No_sites_2026, ")"
+    ), 
+    
+    `%age labs indicating to possess inadequate cadres on site` =  paste0(
+      round((Inadequate_Cadres_2026 / No_sites_2026) * 100, 0), "% (",
+      Inadequate_Cadres_2026, "/", No_sites_2026, ")"
+        )) %>% 
+  select(RRH, 
+         `%age labs with required cadres`,                            
+         `%age labs indicating to possess inadequate cadres on site`
+        )
+
+#### Report - Composition of HR by RRH and health level ####
+#### summarise the data set
+HRSSwll   <-   SSW %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH,LEVEL) %>% 
+  summarise(
+    No_sites    =  n_distinct(HFacility),
+    Required_Cadres  = sum(`The facility possesses all the required cadre categories (See attachment)` == "Y", na.rm = TRUE),
+    Inadequate_Cadres  = sum(`The facility has required cadres, but, in inadequate numbers in the health facility` == "Y", na.rm = TRUE)
+  )
+
+#### re-organise the data frame
+HRSSwllPvt   <-  HRSSwll %>% 
+  pivot_wider(
+    names_from = LEVEL,
+    values_from = c(No_sites, Required_Cadres, Inadequate_Cadres)
+  ) %>% 
+  ungroup() %>%
+  # add rows dynamically
+  # Add totals row dynamically
+  bind_rows(
+    summarise(
+      .,
+      across(where(is.numeric), ~ sum(.x, na.rm = TRUE))
+    ) %>% 
+      mutate(RRH = "NATIONAL") %>% 
+      select(RRH, everything())
+  ) %>%  
+rowwise() %>% 
+  mutate(
+    "HCIII"  =  paste0(`Required_Cadres_HC III`, "/", `No_sites_HC III`),
+    "HCIV"  =  paste0(`Required_Cadres_HC IV`, "/", `No_sites_HC IV`),
+    "GH"  =  paste0(Required_Cadres_HOSPITAL, "/", No_sites_HOSPITAL),
+    "RRHsp"  =  paste0(Required_Cadres_RRH, "/", No_sites_RRH)
+  ) %>% 
+  select(RRH, 
+          HCIII,
+          HCIV,
+          GH,
+         RRHsp )
+
+#### Report - List of cadres not available in health facility ####
+
+#### Prepare the dataset by separating the values that are in comma
+#### correcting / cleaning the names
+SSW$`List of cadre categories unavailable in the facility`  <-  trimws(SSW$`List of cadre categories unavailable in the facility`) 
+SSW$`List of cadre categories unavailable in the facility`  <-  toupper(SSW$`List of cadre categories unavailable in the facility`)
+
+
+### CLEANING
+# Separate values by comma, period, and "and", then remove numbers
+cadreAvail <- SSW %>% 
+  separate_rows(`List of cadre categories unavailable in the facility`, 
+                sep = ",|\\.| and ") %>% 
+    select(1:8, 405, 406)
+
+
+#### Remove the spaces
+cadreAvail$`List of cadre categories unavailable in the facility` <-  trimws(cadreAvail$`List of cadre categories unavailable in the facility`)
+
+#### clean the names
+cadreAvail1   <-  cadreAvail %>% 
+  mutate(`List of cadre categories unavailable in the facility` = recode(`List of cadre categories unavailable in the facility`, 
+    # Old                                  # New
+    "SENIOR LAB TECHNICIAN"       =  "SENIOR LAB TECHNICIAN",
+    "PRINCIPLE LAB TECHNOLOGIST"    =  "PRINCIPAL LAB TECHNOLOGIST",
+    "PRINCIPAL TECHNOLOGIST"    =  "PRINCIPAL LAB TECHNOLOGIST",
+    "CYTOTECHNOLOGIST"            =   "CYTOTECHNOLOGISTS",                                           
+    "SENIOR TECHNICIAN"         =  "SENIOR LAB TECHNICIAN",
+    "SENIOR LAB TECH"         =  "SENIOR LAB TECHNICIAN",
+    "SENIOR LAB TECHNICIAN 01"  =  "SENIOR LAB TECHNICIAN",
+    "SENIOR LAB TECHNICIAN AND CYTOTECHNOLOGIST"    =  "SENIOR LAB TECHNICIAN",
+    "SENIOR LAB TECHNICIAN AND SENIOR LAB TECHNOLOGIST"  =  "SENIOR LAB TECHNICIAN",
+    "SEN LAB TECHNICIAN"     =  "SENIOR LAB TECHNICIAN",
+    "SENIOR LABORATORY TECHNICIANS"  =  "SENIOR LAB TECHNICIAN",
+    "SENIOR LSB TECH"  =  "SENIOR LAB TECHNICIAN",
+    "SENIOR TECHNICIAN1"  =  "SENIOR LAB TECHNICIAN",
+    "SENIN TECHNICIAN2"     =  "SENIOR LAB TECHNICIAN",
+    "SENIN TECHNOLOGIST1"   =  "SENIOR LAB TECHNICIAN",
+    "CYTOTECHENOLOGY"              =      "CYTOTECHNOLOGISTS",  
+    "SENIOR TECHNOLOGIST AND CYTOTECHONOLOGIST"   =      "CYTOTECHNOLOGISTS",  
+    "CYTOTECHNOLOGIST 0"        =      "CYTOTECHNOLOGISTS", 
+    "SENIOR LABORATORY TECHNOLOGIST"   =  "SENIOR LAB TECHNOLOGIST",  
+    "SENIOR LAB TECHNOLOGIST 01"   =  "SENIOR LAB TECHNOLOGIST", 
+    "SENIOR LABORATORY TECHNICIAN"     =  "SENIOR LAB TECHNICIAN",                                 
+     "PRINCIPAL LABORATORY TECHNOLOGIST"    =    "PRINCIPAL LAB TECHNOLOGIST",
+     "TECHNOLOGISTS AND PRINCIPAL LABORATORY TECHNOLOGIST"   = "LAB TECHNOLOGIST", 
+    "TECHNOLOGIST1"   = "LAB TECHNOLOGIST", 
+    "MEDICAL LAB TECHNOLOGIST"   =  "LAB TECHNOLOGIST",                                             
+     "LABORATORY TECHNICIAN"      =   "LAB TECHNICIAN",  
+    "LAB TECH"       =   "LAB TECHNICIAN", 
+    "LAB TECHNICIANS"  =   "LAB TECHNICIAN", 
+    "TECHNICIAN2"  =   "LAB TECHNICIAN", 
+     "LABORATORY ASSISTANT"       =  "LAB ASSISTANT",
+    "LAB ASSISTANTS"         =   "LAB ASSISTANT",
+    "LABORATORY ASSISTANTS"   =   "LAB ASSISTANT",
+     "LABORATORY TECHNOLOGIST  (1)"     = "LAB TECHNOLOGIST",
+    "LABORATORY TECHINOLOGYSTS"    = "LAB TECHNOLOGIST",
+    "LABORATORY TECHNOLOGITS"    =  "LAB TECHNOLOGIST",
+    "LABORATORY TECHONOLOGIST" =  "LAB TECHNOLOGIST",
+    "NO LABORATORY TECHNOLOGIST"  =  "LAB TECHNOLOGIST",
+    
+    "LAB TECHNOLOGITS"   = "LAB TECHNOLOGIST",
+      "CYTOTECHNOLOGIST 3"    =   "CYTOTECHNOLOGISTS",                                              
+     "MEDICAL LABORATORY TECHNOLOGIST 2"      =   "LAB TECHNOLOGIST",                           
+      "SENIOR MEDICAL LABORATORY TECHNICIAN 1"  =  "SENIOR LAB TECHNICIAN",                       
+      "PRINCIPLE TECHNOLOGIST"       =  "PRINCIPAL LAB TECHNOLOGIST",                                      
+       "SENIOR TECHNOLOGIST"       =  "SENIOR LAB TECHNOLOGIST",                                        
+      "SENIOR LAB TECHNOLOGIST 2"     =   "SENIOR LAB TECHNOLOGIST",                                    
+       "LAB TECHNOLOGIST 2"          =      "LAB TECHNOLOGIST",                                    
+     "LAB ASISTANT 1"      =     "LAB ASSISTANT",       
+    "LAB ASSISTANT 1"      =    "LAB ASSISTANT",
+        "SEN LAB TECHNICIAN 1"    =  "SENIOR LAB TECHNICIAN", 
+    "NO SEN LAB TECH"    =  "SENIOR LAB TECHNICIAN",
+      "LAB TECHNOLOGIST 1"          =   "LAB TECHNOLOGIST",                                   
+      "CYTOTECHNOLOGIST 1"          =  "CYTOTECHNOLOGISTS",
+    "CYTOTECHNOLOGISTS"  =  "CYTOTECHNOLOGISTS",
+    "PATHOLOGISTS"    =  "PATHOLOGIST",
+    
+    "AND CYTOTECHNOLOGIST"    =  "CYTOTECHNOLOGISTS",
+    "CYTOTECHNOLOGIST 02"  =    "CYTOTECHNOLOGISTS",
+       "LAB ASISTANT 2"             =  "LAB ASSISTANT",   
+    "LAB ASSISTANTS 2"     =  "LAB ASSISTANT",
+       "LABORATORY TECHNOLOGIST"    =  "LAB TECHNOLOGIST",                                  
+       "LAB TECHNICIAN"             =      "LAB TECHNICIAN",                                         
+        "SENIOR LABORATORY TECHNICIAN AND SENIOR LABORATORY TECHNOLOGIST" = "SENIOR LAB TECHNICIAN",
+        "SENIOR LABORATORY TECHNICIAN AND TECHNOLOGIST"    =  "SENIOR LAB TECHNICIAN",                
+        "TECHNOLOGIST"      =     "LAB TECHNOLOGIST",                                                 
+        "LABORATORY  ASSISTANT"   =  "LAB ASSISTANT",                                          
+      "SENIOR TECHNOLOGIST AND SENIOR TECHNICIAN"    =  "SENIOR LAB TECHNICIAN",                   
+      "MEDICAL LAB"       =  "LAB TECHNOLOGIST",                                                  
+         "TECHNICIAN"       =   "LAB TECHNICIAN",
+       "SENIOR MEDICAL LABORATORY TECHNOLOGIST"    =     "SENIOR LAB TECHNOLOGIST",                        
+        "MEDICAL LABORATORY TECHNOLOGIST"       =   "LAB TECHNOLOGIST",                             
+       "MEDICAL LABORATORY TECHNICIAN"          =  "LAB TECHNICIAN",                               
+       "CYTO TECHNOLOGISTS"            =  "CYTOLOGISTS",                                    
+      "SENIOR LAB TECHNOLOGISTS"      =  "SENIOR LAB TECHNOLOGIST", 
+       "LAB ASSISSTANTS"              =  "LAB ASSISTANT", 
+         "ASSISTANT2"    =  "LAB ASSISTANT", 
+    "CLEANER AND DATA CLERK"   =  "DATA CLERK",
+       "1 SENIOR LAB TECHNOLOGIST"      =  "LAB TECHNOLOGIST",                                  
+      "1 SENIOR LAB TECHNICIAN AND 3 LAB TECHNOLOGISTS"   = "SENIOR LAB TECHNICIAN",               
+       "MEDICAL LABARATORY  TECHNOLOGISTS"  =  "LAB TECHNOLOGIST",                             
+       "SENIOR MEDICAL TECHNICIAN"      =   "SENIOR LAB TECHNICIAN",                                   
+      "TECHNOLOGIST 1"               =  "LAB TECHNOLOGIST",                                   
+       "SENIOR LAB  TECHNICIAN 1"   =  "SENIOR LAB TECHNICIAN",                                       
+      "LAB TECHNICIAN 1"          = "LAB TECHNICIAN",                                      
+     "LAB ASSISTANT 3"          =  "LAB ASSISTANT", 
+   " LAB ASSISTANTS 2"    =  "LAB ASSISTANT", 
+     "1 TECHNOLOGIST"      =  "LAB TECHNOLOGIST",                                             
+      "1 TECHNICIAN"          = "LAB TECHNICIAN",                                           
+      "3 ASSISTANTS"          =     "LAB ASSISTANT",                                    
+      "SENIOR CONS HISTOPATHOLOGY"   =  "SENIOR CONSULTANT HISTOPATHOLOGY",                                  
+      "SENIOR CONS CLINICAL MB"     = "SENIOR CONSULTANT CLINICAL MICROBIOLOGY",                             
+       "CONS CLINICAL MB"     = "SENIOR CONSULTANT CLINICAL MICROBIOLOGY",                                          
+     "CONS HISTO"         =  "SENIOR CONSULTANT HISTOPATHOLOGY",                                          
+       "MOSG (HISTO)"       =  "SENIOR CONSULTANT HISTOPATHOLOGY",                                               
+       "MOSG (CLINICAL"     = "SENIOR CONSULTANT CLINICAL MICROBIOLOGY",
+        "PRINCIPAL CYTO"    =  "PRINCIPAL CYTOLOGIST",                                            
+     "SENIOR CYTO"      =  "SENIOR CYTOLOGIST",                                                 
+       "PRINCIPAL MLT"    =        "PRINCIPAL LAB TECHNOLOGIST",                                             
+        "SENIOR MLT"         =   "SENIOR LAB TECHNOLOGIST",                                               
+       "MLT"       =           "LAB TECHNOLOGIST",                                                 
+       "LABORATORY ATTENDANT"   =  "LAB ATTENDANT",                         
+     "SENIOR LAB TECHNICIAN 1"       =      "SENIOR LAB TECHNICIAN",                                
+       "LAB ASSISTANT1"       =  "LAB ASSISTANT",
+    "CYTOLOGIST"   =   "CYTOLOGISTS",
+   "CYTO TECHNICIAN1"   =   "CYTOLOGISTS",
+   
+        "PRINCIPLE LAB TECHNOLOGIST"  =  "PRINCIPAL LAB TECHNOLOGIST",
+   "RADIOGRAPHER 03"   =  "RADIOGRAPHER"
+                   )
+       ) %>% 
+  filter(!`List of cadre categories unavailable in the facility`
+         %in% c("A", "N", "STAFFING IS AT 13/19", "STAFFING NUMBERS HAVE NOT BEEN MET")
+         )
+
+
+#### Cadres not available in total ####
+UnavailRprt <- cadreAvail1 %>%
+  filter(Yr == "2026") %>% 
+  filter(!is.na(`List of cadre categories unavailable in the facility`)) %>%
+  mutate(`List of cadre categories unavailable in the facility` = str_trim(`List of cadre categories unavailable in the facility`)) %>% # Trim spaces
+  filter(!`List of cadre categories unavailable in the facility` 
+         %in% c("2", "LAB", "MB", "MED", "SEN","MB)","")) %>% 
+  group_by(`List of cadre categories unavailable in the facility`) %>%
+  summarise(No.sitesreporting = n(), 
+            .groups = "drop") %>% 
+  arrange(No.sitesreporting)
+  
+
+
+#### Cadres not available by health level ####
+Unavaillel <- cadreAvail1 %>%
+  filter(Yr == "2026") %>% 
+  filter(!is.na(`List of cadre categories unavailable in the facility`)) %>%
+  mutate(`List of cadre categories unavailable in the facility` = str_trim(`List of cadre categories unavailable in the facility`)) %>% # Trim spaces
+  filter(!`List of cadre categories unavailable in the facility`
+         %in% c("2", "LAB", "MB", "MED", "SEN","MB)","")) %>% 
+     group_by(`List of cadre categories unavailable in the facility`,LEVEL) %>%
+         summarise(
+                    No.sitesreporting = n_distinct(HFacility), 
+                   .groups = "drop")
+
+#### re arrange the data
+UnavaillelPvt   <-  Unavaillel %>% 
+  pivot_wider(
+    names_from = LEVEL,
+    values_from = No.sitesreporting
+  ) %>% 
+mutate(
+  RRHProp  =  paste0(RRH, "/", RRHSts),
+  GHProps  =  paste0(HOSPITAL, "/", GHSts),
+  HCIVProps  =  paste0(`HC IV`, "/", HCIVSts),
+  HCIIIProps  =  paste0(`HC III`, "/", HCIIISts)
+  ) %>% 
+  select(`List of cadre categories unavailable in the facility`,
+         RRHProp,GHProps,HCIVProps,HCIIIProps 
+         )
+
+
+# re arrange the title from highest to lowest
+UnavaillelRpt  <-  UnavaillelPvt %>% 
+  filter(`List of cadre categories unavailable in the facility` != "CLINICIAN") %>% 
+  mutate(`List of cadre categories unavailable in the facility` = factor(
+    `List of cadre categories unavailable in the facility`,
+    levels = c(
+      "PATHOLOGIST",
+      "CYTOTECHNOLOGISTS",
+      "SENIOR LAB TECHNOLOGIST", 
+      "PRINCIPAL LAB TECHNOLOGIST", 
+      "LAB TECHNOLOGIST",
+      "PRINCIPAL LABORATORY TECHNICIAN", 
+      "SENIOR LAB TECHNICIAN", 
+      "RADIOGRAPHER",
+      "LAB TECHNICIAN",
+      "LAB ASSISTANT", 
+      "IT OFFICER", 
+      "DATA CLERK", 
+      "CLEANER", 
+      "BIKE RIDER"
+    )
+  ))%>% 
+    arrange(`List of cadre categories unavailable in the facility`)
+
+
+#### Report - list of cadres not available by RRH and health level ####
+Unavaillelrrh <- cadreAvail1 %>%
+  filter(Yr == "2026") %>% 
+  filter(!is.na(`List of cadre categories unavailable in the facility`)) %>%
+  mutate(`List of cadre categories unavailable in the facility` = str_trim(`List of cadre categories unavailable in the facility`)) %>% # Trim spaces
+  filter(!`List of cadre categories unavailable in the facility`
+         %in% c("2", "LAB", "MB", "MED", "SEN","MB)","")) %>% 
+  group_by(`List of cadre categories unavailable in the facility`,RRH, LEVEL) %>%
+  summarise(
+    No.sitesreporting = n_distinct(HFacility), 
+    .groups = "drop")%>% 
+  left_join(sitesDashlvl, by = c("RRH", "LEVEL"))%>% 
+  mutate(
+    PropWithCadre  =  paste0(`No.sitesreporting`, "/", No.SitesVisited),
+      ) %>% 
+  select(`List of cadre categories unavailable in the facility`,
+         RRH, LEVEL,  PropWithCadre
+  )
+
+# re-arrange the data
+UnavaillelrrhPvt   <-  Unavaillelrrh %>% 
+  rename("RRH_Region"   =  "RRH") %>% 
+  pivot_wider(
+    id_cols = c("RRH_Region", "List of cadre categories unavailable in the facility"),
+    names_from = LEVEL,
+    values_from = PropWithCadre
+  )
+
+#### Report - Staff receive targeted capacity building ####
+cbuild   <-  SSW %>% 
+  filter(Yr == "2026") %>% 
+  summarise(
+    Indicator    =  "%age of labs whose lab staff receive technical capacity building", 
+    No.sites     =  n_distinct(HFacility),
+    ReportedSites  =  sum(`The staff receive targeted capacity-building` == "Y")
+  ) %>% 
+  mutate(
+    `%age of sites`  = round((ReportedSites/No.sites)*100,0) 
+  )
+
+#### Report - Staff receive targeted capacity building by RRH ####
+cbuildrrh   <-  SSW %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>% 
+      summarise(
+        No.Sites  =  n_distinct(HFacility),
+        No.capacity_build   =  sum(`The staff receive targeted capacity-building` == "Y", na.rm = TRUE),
+        .groups = "drop"
+      ) %>% 
+      bind_rows(
+         tibble(
+           RRH  =  "National",
+           No.Sites   =  sum(.$`No.Sites`),
+           `No.capacity_build`    =  sum(.$`No.capacity_build`)
+    ))    %>% 
+      mutate(
+        PropWithtech_Cap  =  paste0(`No.capacity_build`, "/", No.Sites),
+      ) %>% 
+      select(RRH, PropWithtech_Cap)
+  
+#### Report - Other gaps and recommendations ####
+dfHR1 <- SSW %>%
+  filter(Yr == "2026") %>% 
+  mutate(themeHRGaps = case_when(
+    str_detect(`Other gaps, recommendations...98`, "skill|career") ~ "Inadequate skill",
+    str_detect(`Other gaps, recommendations...98`, "wage|funds") ~ "Inadequate wage",
+    str_detect(`Other gaps, recommendations...98`, "Plan|plans") ~ "No/Inadequate,clear planning",
+    str_detect(`Other gaps, recommendations...98`, "staffing|structure|number|cadre|understaffing|
+               human resource|limited|recruitment|inadquaete|STAFFING|recruit") ~ "Inadequate HR",
+    TRUE ~ "Other"
+  ))
+
+
+#### the frequencies
+dfHR1 %>%
+  filter(!is.na(`Other gaps, recommendations...98`)) %>% 
+  group_by(themeHRGaps) %>% 
+  count(`Other gaps, recommendations...98`) %>%
+  arrange(desc(n))
+
+#### plot the graph
+
+ggplot(dfHR1, aes(x = themeHRGaps)) +
+  geom_bar(fill = "steelblue") +
+  theme_minimal() +
+    labs(title = "Common mentions of HR gaps and challenges", x = "Theme", y = "Count"
+       ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10))
+
+#### Report - Reasons for Gap #####
+
+#### Report - Other gaps and recommendations ####
+dfHRreasons <- SSW %>%
+  filter(Yr == "2026") %>% 
+  mutate(themeHRGaps_reasons = case_when(
+    str_detect(`Root Causes Leading to the Gaps / Challenges...99`, "turnover") ~ "Staff turnover",
+    str_detect(`Root Causes Leading to the Gaps / Challenges...99`, "Inadequate resources|wage|") ~ "Inadequate HR funding",
+    TRUE ~ "Other"
+  ))
+
+
+#### the frequencies
+dfHRreasons %>%
+  filter(!is.na(`Root Causes Leading to the Gaps / Challenges...99`)) %>% 
+  count(`Root Causes Leading to the Gaps / Challenges...99`) %>%
+  arrange(desc(n))
+
+#### plot the graph
+
+ggplot(dfHRreasons, aes(x = themeHRGaps_reasons)) +
+  geom_bar(fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "Common mentions of reasons for HR gaps and challenges", x = "Theme", y = "Count"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10))
+
+#### HR Action Tracker ####
+HRtracker <-   SSW %>% 
+  select(RRH,District, HFacility,VDate, 21:24) %>% 
+    
+  rename(
+    "Identified Gap"  =  `<span style="display:none">row-Gap</span>...107`,
+    "Agreed Action Point" =  `<span style="display:none">row-Agreed Action Point</span>...108`,
+    "Institution Responsible"  =  `<span style="display:none">row-Person/s / Institution Responsible</span>`,
+    "Timelines"   =  `<span style="display:none">row-Timelines</span>`   
+  )
+    
+#### step 2
+HRtracker1 <-   SSW %>% 
+  select(RRH,District,HFacility, VDate, 26:29)
+# rename column names
+colnames(HRtracker1) <- c("RRH", "District", "HFacility", "VDate", "Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+#### step 3
+HRtracker2 <-   SSW %>% 
+  select(RRH,District, HFacility,VDate, 31:34)
+# rename column names
+colnames(HRtracker2) <- c("RRH", "District", "HFacility", "VDate", "Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### step 4
+HRtracker3 <-   SSW %>% 
+  select(RRH,District, HFacility,VDate,36:39)
+
+# rename column names
+colnames(HRtracker3) <- c("RRH", "District", "HFacility", "VDate", "Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+HRtrackerRpt <- rbind(HRtracker,HRtracker1, HRtracker2, HRtracker3)
+
+HRtrackerRpt   <-  HRtrackerRpt %>% 
+  filter(!is.na(`Identified Gap`)) %>% 
+  arrange(RRH,District,HFacility, VDate) %>% 
+  mutate(
+    Section = "HR"
+  )
+
+#### clean the Timelines, using "clean_deadlines" function
+HRtrackerRpt1   <-  HRtrackerRpt %>% 
+  mutate(
+    VDate_date = as.Date(VDate),
+    due_date = do.call(
+      c,
+      map2(
+        Timelines, VDate_date,
+        ~ clean_deadlines(.x, ref_date = .y, month_deadline = "last_day")$due_date
+      )
+    ),
+    ActionMonth = month(due_date, label = TRUE, abbr = TRUE),
+    ActionYr    = year(due_date)
+  )
+
+#### the table
+tble_HRtracker  <-   flextable(HRtrackerRpt)
+  
+#### format the table
+tble_HRtracker  <-  tble_HRtracker %>% 
+  set_header_labels(
+    RRH    =   "RRH",
+    District   =  "District",
+    HFacility   =   "Health Facility",
+    `<span style="display:none">row-Gap</span>...107`  =  "Identified Gap",
+    `<span style="display:none">row-Agreed Action Point</span>...108` =   "Agreed Action Point",
+    `<span style="display:none">row-Person/s / Institution Responsible</span>`    =   "Institution Responsible",
+    `<span style="display:none">row-Timelines</span>`   =   "Timelines"
+    
+    )%>%
+  theme_vanilla() %>%  # Optional: Apply a minimal theme
+  fontsize(size = 9, part = "all") %>%  # Reduce font size
+  line_spacing(space = 1.0) %>%  # Minimize row spacing
+  padding(padding = 2, part = "all") %>%  # Reduce padding
+  width(j = c("Identified Gap", "Agreed Action Point", "Institution Responsible"), width = 6)  # Adjust column width
+
+
+tble_HRtracker  <-  tble_HRtracker %>% 
+  vline(j=c(1,2,3,4,5,6,7), part = "all")
+# Display the table
+tble_HRtracker   <-  tble_HRtracker %>% 
+  add_header_row(values = "HR action tracker", colwidths = 
+                   ncol(HRtrackerRpt))
+tble_HRtracker
+####################################################################
+####################################################################
+#### Service Delivery ####
+serDel  <-  SSW %>% 
+  select(District,HFacility,LEVEL,VDate,47:85,405,406,407)
+
+#### Report - Test menu ####
+facTestM  <-  serDel %>% 
+  filter(Yr == "2026") %>% 
+  summarise(
+    Indicator       =  "%age of sites implementing >85% of test menu", 
+    No.sites  =     n_distinct(HFacility),
+    ReportedSites  =  sum(`The facility is performing all tests as defined by the National Test Menu for the health level, and/or, as identified for targeted interventions (e.g. POC, AHD tests)` == "Y")
+  ) %>% 
+  mutate(
+    `%age of sites`  = round((ReportedSites/No.sites)*100,0) 
+  )
+  
+#### Report - test menu by RRH ####
+RRHfacTestM  <-  serDel %>% 
+  rename("TestMenu" = "The facility is performing all tests as defined by the National Test Menu for the health level, and/or, as identified for targeted interventions (e.g. POC, AHD tests)") %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility),
+    
+    # Complete compliance
+    No.CTMenu  =  sum(TestMenu == "Y", na.rm = TRUE),
+    
+    # Partial compliance
+    No.PTMenu  =  sum(TestMenu == "P", na.rm = TRUE)
+    
+  ) %>% 
+  
+  mutate(
+    # Numeric indicators first
+    Pct_CTMenu  = round((No.CTMenu / No.sites) * 100, 0),
+    
+    # weighted only when partial exists
+    
+    Weighted_Score_num  = ifelse(
+      No.PTMenu > 0, 
+      round(
+        ((No.CTMenu + (0.5 * No.PTMenu)) / No.sites) * 100, 0
+      ), NA),
+    
+    # Formatted display
+    `%age of sites with complete complaince`  = paste0(Pct_CTMenu, "% (", No.CTMenu,"/",No.sites,")"),
+    
+    # only if partial exists
+    
+    `Status resulting from observed partial performance`  = ifelse(
+      No.PTMenu > 0,
+      paste0(
+        Weighted_Score_num, "% (", 
+        round(No.CTMenu + (0.5 * No.PTMenu),1), "/", No.sites, ")"
+      ),
+      "NA"
+    ),
+    # Interpretation
+    Interpretation = case_when(
+      Pct_CTMenu  == 0 ~ "No lab met the target",
+      Pct_CTMenu  == 100 ~ "All labs met target",
+      No.PTMenu == 0 & Pct_CTMenu  < 100 ~ "Address the non-performing site(s)",
+      No.PTMenu > 0 ~ "Partial performance observed – address the site(s)",
+      
+    )) %>% 
+  mutate(
+    Indicator  =  "%age of labs implementing >85% of test menu",
+    # Flag: Number with Partial responses
+    Partial_Status_Observed = ifelse(No.PTMenu > 0, "Yes", "None")
+  ) %>% 
+  select(
+    RRH,  Indicator, `%age of sites with complete complaince`, Partial_Status_Observed, `Status resulting from observed partial performance`, Interpretation    
+  )
+
+  
+  
+  
+  
+  
+  
+  group_by(RRH) %>% 
+  summarise(
+    No.sites_allTestMenu  =  sum(`The facility is performing all tests as defined by the National Test Menu for the health level, and/or, as identified for targeted interventions (e.g. POC, AHD tests)` == "Y", na.rm = TRUE)
+  ) %>% 
+  bind_rows(
+    tibble(
+      RRH   =  "NATIONAL",
+      `No.sites_allTestMenu`    =  sum(.$`No.sites_allTestMenu`)
+    )) %>% 
+  left_join(sitesDash, by = "RRH") %>% 
+  mutate(
+    TestMenu_Ser  =  paste0(`No.sites_allTestMenu`, "/", `No.SitesVisited`)
+      )
+
+#### Report - Service delivery action tracker ####
+#### step 1
+sertracker1 <-   serDel %>% 
+  select(RRH,District, HFacility,VDate,16:19)
+# rename column names
+colnames(sertracker1) <- c("RRH", "District", "HFacility","VDate", "Identified Gap",
+                             "Agreed Action Point", "Institution Responsible", 
+                             "Timelines")
+
+#### step 2
+sertracker2 <-   serDel %>% 
+  select(RRH,District, HFacility,VDate,21:24)
+# rename column names
+colnames(sertracker2) <- c("RRH", "District", "HFacility", "VDate", "Identified Gap",
+                             "Agreed Action Point", "Institution Responsible", 
+                             "Timelines")
+
+#### step 3
+sertracker3 <-   serDel %>% 
+  select(RRH,District, HFacility,VDate,26:29)
+# rename column names
+colnames(sertracker3) <- c("RRH", "District", "HFacility", "VDate", "Identified Gap",
+                             "Agreed Action Point", "Institution Responsible", 
+                             "Timelines")
+
+#### step 4
+sertracker4 <-   serDel %>% 
+  select(RRH,District, HFacility,VDate,31:34)
+# rename column names
+colnames(sertracker4) <- c("RRH", "District", "HFacility","VDate",  "Identified Gap",
+                             "Agreed Action Point", "Institution Responsible", 
+                             "Timelines")
+
+#### step 5
+sertracker5 <-   serDel %>% 
+  select(RRH,District, HFacility,VDate,36:39)
+# rename column names
+colnames(sertracker5) <- c("RRH", "District", "HFacility","VDate",  "Identified Gap",
+                             "Agreed Action Point", "Institution Responsible", 
+                             "Timelines")
+
+#### step 5
+sertracker6 <-   serDel %>% 
+  select(RRH,District, HFacility,VDate,41:44)
+# rename column names
+colnames(sertracker6) <- c("RRH", "District", "HFacility", "VDate", "Identified Gap",
+                           "Agreed Action Point", "Institution Responsible", 
+                           "Timelines")
+
+#### combine the data frames
+
+sertrackerRpt <- rbind(sertracker1, sertracker2, sertracker3, sertracker4, 
+                       sertracker5, sertracker6)
+
+#### filter rows without gaps
+sertrackerRpt   <-  sertrackerRpt %>% 
+  filter(!is.na(`Identified Gap`)) %>% 
+  arrange(RRH,District,HFacility,VDate)%>% 
+  mutate(
+    Section = "Service Delivery"
+  )
+
+#### clean the Timelines, using "clean_deadlines" function
+sertrackerRpt1   <-  sertrackerRpt %>% 
+  mutate(
+    VDate_date = as.Date(VDate),
+    due_date = do.call(
+      c,
+      map2(
+        Timelines, VDate_date,
+        ~ clean_deadlines(.x, ref_date = .y, month_deadline = "last_day")$due_date
+      )
+    ),
+    ActionMonth = month(due_date, label = TRUE, abbr = TRUE),
+    ActionYr    = year(due_date)
+  )
+
+
+
+#### the table
+tble_sertrackerRpt  <-   flextable(sertrackerRpt)
+
+
+#### format the table
+tble_sertrackerRpt  <-  tble_sertrackerRpt %>% 
+  theme_vanilla() %>%  # Optional: Apply a minimal theme
+  fontsize(size = 9, part = "all") %>%  # Reduce font size
+  line_spacing(space = 1.0) %>%  # Minimize row spacing
+  padding(padding = 2, part = "all") %>%  # Reduce padding
+  width(j = c("Identified Gap", "Agreed Action Point", "Institution Responsible"), width = 6
+  )  # Adjust column width
+
+
+tble_sertrackerRpt  <-  tble_sertrackerRpt %>%  
+  vline(j=c(1,2,3,4,5,6,7), part = "all")
+# Display the table
+
+tble_sertrackerRpt  <-  tble_sertrackerRpt %>%  
+  add_header_row(values = "Test Menu action tracker",
+                 colwidths = ncol(sertrackerRpt))
+
+tble_sertrackerRpt
+
+#####################################################################
+#####################################################################
+##### Equipment ####
+#### selecting equipment section
+equip   <-  SSW %>% 
+  select(District,HFacility,LEVEL,VDate,87:124,404, 405, 406)
+
+#### Report - %age of facilities with non-functional equipment ####
+ovlnonFnl  <-  equip %>% 
+  rename("NonFunctional"  = "The facility has non-functional equipment") %>% 
+  filter(Yr == "2026") %>% 
+  summarise(
+    Indicator    =  "%age of labs with non-functional equipment", 
+    No.sites     =  n_distinct(HFacility),
+    ReportedSites  =  sum(NonFunctional == "Y")
+  ) %>% 
+  mutate(
+    `%age of sites`  = round((ReportedSites/No.sites)*100,0) 
+  )
+
+#### Report - RRH - %age of facilities with non-functional equipment and long Break downby RRH ####
+nonftl   <-   equip %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.sites   =   n_distinct(HFacility),
+    No.nftl    =   sum(`The facility has non-functional equipment` == "Y", na.rm = TRUE),
+    No.longBDown =  sum(`Facility experienced prolonged equipment downtime (more than 30 days) in the 6 months preceding this visit` == "Y", na.rm = TRUE)
+  )%>% 
+  bind_rows(
+    tibble(
+      RRH   =  "NATIONAL",
+      No.sites    =  sum(.$No.sites),
+      No.nftl     =  sum(.$No.nftl),
+      No.longBDown = sum(.$No.longBDown)
+    )) %>% 
+  mutate(
+    Prop_NonFnlEquip  =  paste0(No.nftl, "/", No.sites),
+    Prop_NoLongBDwn   =  paste0(No.longBDown, "/", No.sites)
+  )
+
+#### Report  -  Equipment not serviced as scheduled - RRH ####
+equipSerrrh   <-  equip %>%
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.sites  =  n_distinct(HFacility),
+    No.sitesNot_scheduled_ser  =  sum(`Facility has equipment not serviced as scheduled` %in% c("Y","P"))
+  ) %>% 
+  mutate(
+    "Proportion of sites with equipment not serviced as scheduled"  =  paste0(No.sitesNot_scheduled_ser, "/", No.sites)
+    )
+
+#### report  - list equipment not serviced as scheduled ####
+### CLEANING
+equip$`If Yes, No. and List of equipment not be serviced as scheduled` <-
+  toupper(equip$`If Yes, No. and List of equipment not be serviced as scheduled`)
+
+# Separate values by comma, period, and "and", then remove numbers
+listEquipS   <-  equip %>%
+  separate_rows(`If Yes, No. and List of equipment not be serviced as scheduled`, 
+                sep = ",|\\.| AND ")
+ #### trim the names
+listEquipS$`If Yes, No. and List of equipment not be serviced as scheduled`<-
+  trimws(listEquipS$`If Yes, No. and List of equipment not be serviced as scheduled`
+         )
+
+#### Cleaning the equipment names
+listEquipS  <-   listEquipS %>% 
+  mutate(`If Yes, No. and List of equipment not be serviced as scheduled`  =  recode(`If Yes, No. and List of equipment not be serviced as scheduled`,
+      # old                    # New
+      "BD-PRESTO"     = "BD FACS PRESTO",
+      "BSC-01"      =   "BSC",                                                                  
+      "MICROSCOPES-05"      =  "MICROSCOPE",                                                    
+      "CENTRIFUGE - 01"      =   "CENTRIFUGE",                                                      
+      "AC'S -04"               =  "AC",              
+      "HUMALYTE PLUS 3"       =   "HUMAN DIAGNOSTICS",
+      "NONE"             =   "ALL", 
+      "HUMALYTE PLUS BECAUSE IT HAS NO REAGENT CELL PACK"   =  "HUMAN DIAGNOSTICS",
+      "ALL LAB EQUIPMENTS ARE DUE FOR SERVICE"      =  "ALL",
+      "02- BD PRESTO"      =  "BD FACS PRESTO",                                                       
+      "ALERE MPIMA"      =   "M-PIMA",                                                        
+      "BIOMETRIC MACHINE 03"     =   "BIOMETRIC MACHINE",                                                 
+      "FIRE EXTINGUISHERS 06"     =    "FIRE EXTINGUISHER",                                                
+      "FIRE ALARM SYSTEM 01"          =   "FIRE ALARM SYSTEM",                                             
+      "BIOSAFETY CABINET"      =  "BSC",                                                   
+      "(2) REFRIDGERATOR"       =  "FRIDGE",                                                      
+      "(1) CENTRIFUGE THESE ARE FAULTY"    =  "CENTRIFUGE",                                       
+      "NOT SERVICED"   =  "ALL",                                                         
+      "CENTRIFUGE NOT SERVICED"     =  "CENTRIFUGE",                                               
+      "AIR CONDITIONER"        =  "AC",
+      "PIMA"      =   "M-PIMA",                                                              
+      "HUMASTAR 80 (CHEMISTRY ANALYSER)"    =  "HUMAN DIAGNOSTICS",                                      
+      "FIRE EXTINGUISHER 1"     =  "FIRE EXTINGUISHER",                                                   
+      "CHEMISTRY ANALYSER HUMASTER 200"     =   "HUMAN DIAGNOSTICS",
+      "FACS PRESTO WAS NOT SERVICED"      =   "BD FACS PRESTO",
+      "MICROSCOPE (1)"       =   "MICROSCOPE",                                                   
+      "HEMOCUE(1)"          =   "HEMOCUE",                                                       
+      "REFRIGERATOR (1)"      =   "FRIDGE",                                                  
+      "GLUCOMETER(4)"        =  "GLUCOMETER",                                                       
+      "THE BINOCULAR MICROSCOPE"   =  "MICROSCOPE",                                               
+      "REFRIGERATOR"        = "FRIDGE",
+      "FRIDGES"     =   "FRIDGE",                                                         
+      "2 MICROSCOPES"   =  "MICROSCOPE",                                                         
+      "3 REFRIGERATORS"    = "FRIDGE",
+      "FRIDGE IN MICROBIOLOGY" = "FRIDGE",
+      "TWO MICROSCOPES"   =  "MICROSCOPE",                                                       
+      "4 REFRIGERATORS"  =  "FRIDGE",                                                          
+      "MICROSCOPES"   =  "MICROSCOPE",                                                           
+      "02 MICROSCOPES DUE TO FOR SERVICE THIS MONTH OF MARCH"  =  "MICROSCOPE",                  
+      "CENTRIFUGE NON FUNCTIONAL"       =  "CENTRIFUGE",
+      "BLOOD BANK FRIDGE MALFUNCTIONING" = "FRIDGE",
+      "FRIDGE IN BIO CHEMISTRY  SECTION" = "FRIDGE",
+      "ALL EQUIPMENTS AVAILABLE ARE SERVICED"   =   "",                                  
+      "4"     =   "NOT SPECIFIC",                                                                       
+      "2"    =   "NOT SPECIFIC",                                                                      
+      "03"    =   "NOT SPECIFIC",                                                                      
+      "7 EQUIPMENTS NOT SERVICED"  =   "NOT SPECIFIC",                                              
+      "6 EQUIPMENT"   =   "NOT SPECIFIC", 
+      "07 EQUIPMENT"  =   "NOT SPECIFIC",                                                           
+      "(THESE EQUIPMENT ARE TO BE SERVICED BY SOROTI REGION EQUIPMENT WORKSHOP)" =   "NOT SPECIFIC",
+      "3 EQUIPMENT"     =   "NOT SPECIFIC",                                                            
+      "HOT AIR OVEN COMPLETELY NON FUNCTIONAL"  =   "NOT SPECIFIC" ,
+      "HUMA COUNT 30TS"    =  "HUMAN DIAGNOSTICS",
+      "HUMACOUNT 5D"       =  "HUMAN DIAGNOSTICS",
+      "HUMALYTE PLUS3"     =  "HUMAN DIAGNOSTICS",
+      "HUMAN MACHINES"     =  "HUMAN DIAGNOSTICS",
+      "HUMANCOUNT 60TS"    =  "HUMAN DIAGNOSTICS",
+      "HUMANCOUNT 80"      = "HUMAN DIAGNOSTICS",
+      "HUMACOUNT 30"      = "HUMAN DIAGNOSTICS",
+      "HUMACOUNT"       = "HUMAN DIAGNOSTICS",
+      "HUMASTAR"           =  "HUMAN DIAGNOSTICS",
+      "HUMASTAR 200"      =  "HUMAN DIAGNOSTICS",
+      "HUMALYTE PLUS"     =  "HUMAN DIAGNOSTICS",
+      "HUMALYSER"         =  "HUMAN DIAGNOSTICS",
+      "HUMALYTE"          =  "HUMAN DIAGNOSTICS",
+      "HUMASTAR 80"       =  "HUMAN DIAGNOSTICS",
+      "HUMALYTE 200"    =  "HUMAN DIAGNOSTICS",
+      "COBAS 311"      =  "COBAS" 
+              ))
+
+#### Report - equipment not serviced as scheduled ####
+equipSer   <-  listEquipS %>%
+  filter(Yr == "2026") %>% 
+  rename("Unserviced"  = "Facility has equipment not serviced as scheduled") %>% 
+  filter(Yr == "2026") %>% 
+  summarise(
+    Indicator    =  "%age of labs with equipment not serviced as scheduled", 
+    No.sites     =  n_distinct(HFacility),
+    ReportedSites  =  sum(Unserviced == "Y")
+  ) %>% 
+  mutate(
+    `%age of sites`  = round((ReportedSites/No.sites)*100,0) 
+  )
+
+#### %age of sites reporting unsheduled Service by RRH ####
+hflistEquiprrhSrpt   <-   listEquipS %>%
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.Sites = n_distinct(HFacility),
+    
+    No.sites_withunserviced = n_distinct(
+      HFacility[`Facility has equipment not serviced as scheduled` == "Y"]
+    ),
+    
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    PctSites_withUnsercdEquip = round(
+      (No.sites_withunserviced / No.Sites) * 100, 0
+    )
+  )
+
+
+#### Report - Number of sites with equipment with unscheduled servicing ####
+hflistEquipS   <-   listEquipS %>%
+  filter(Yr == "2026") %>% 
+    group_by(`If Yes, No. and List of equipment not be serviced as scheduled`) %>% 
+  summarise(
+    No.sites_withunserviced  =   n()
+  ) %>% 
+  arrange(desc(No.sites_withunserviced)) %>% 
+    filter(!`If Yes, No. and List of equipment not be serviced as scheduled` %in%
+             c(NA,"","NA","N/A")) %>% 
+  rename(
+    "Equipment Category"  =  "If Yes, No. and List of equipment not be serviced as scheduled"
+  )
+
+#### Report - sites reporting unserviced equipment by RRH ####
+RRHhflistEquipS   <-   listEquipS %>%
+  filter(Yr == "2026") %>% 
+  group_by(RRH,`If Yes, No. and List of equipment not be serviced as scheduled`) %>% 
+  summarise(
+    No.sites_withunserviced  =   n()
+  ) %>% 
+  filter(!`If Yes, No. and List of equipment not be serviced as scheduled` %in%
+           c(NA,"","NA","N/A"))
+
+#### Re arrange the data frame
+RRHhflistPvt <-  RRHhflistEquipS %>% 
+  pivot_wider(
+    names_from = `If Yes, No. and List of equipment not be serviced as scheduled`,
+    values_from = No.sites_withunserviced
+  )
+
+#### Report - Linelist of HFacilities with unscheduled equipment service ####
+HFacListEqSer   <-   listEquipS %>%
+  filter(Yr == "2026") %>% 
+  select(RRH,District,HFacility,LEVEL,VDate, `Facility has equipment not serviced as scheduled`, `If Yes, the Number and List of Non-functional equipment`) %>% 
+  group_by(RRH) %>% 
+  filter(`Facility has equipment not serviced as scheduled` == "Y")
+#####################################################################
+#####################################################################
+#### Report  -  Equipment with long downtime ####
+equiplongDT   <-  equip %>% 
+  filter(Yr == "2026") %>% 
+  summarise(
+    Indicator       =  "%age of sites with equipment with long downtime", 
+    No.sites  =  n_distinct(HFacility),
+    ReportedSites  =  sum(`Facility experienced prolonged equipment downtime (more than 30 days) in the 6 months preceding this visit` %in% c("Y","P"))
+  ) %>% 
+  mutate(
+    `%age of sites`  = round((ReportedSites/No.sites)*100,0) 
+  )
+
+#### Report - %age of sites with long downtime by RRH ####
+rrhlongdts   <-   listEquipS %>%
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility),
+    No.sites_withlongEqp_Dwntime  =   n_distinct(HFacility [`Facility experienced prolonged equipment downtime (more than 30 days) in the 6 months preceding this visit` == "Y"]),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    `%age of sites with long Equip. Downtime` = paste0(`No.sites_withlongEqp_Dwntime`, "/", No.sites,
+                             "(",
+                            round((`No.sites_withlongEqp_Dwntime`/No.sites)*100,0),"%", 
+                            ")"
+                             )) %>% 
+                                select(RRH, `%age of sites with long Equip. Downtime`)
+    
+
+#### report  - list equipment with >30 day down time ####
+equip$`If Yes, no and List of equipment indicated to have prolonged equipment downtime` <-
+  toupper(equip$`If Yes, no and List of equipment indicated to have prolonged equipment downtime`)
+
+### CLEANING
+# Separate values by comma, period, and "and", then remove numbers
+listEquipdt   <-  equip %>%
+  separate_rows(`If Yes, no and List of equipment indicated to have prolonged equipment downtime`, 
+                sep = ",|\\.| AND ")
+#### trim the names
+listEquipdt$`If Yes, no and List of equipment indicated to have prolonged equipment downtime`<-
+  trimws(listEquipdt$`If Yes, no and List of equipment indicated to have prolonged equipment downtime`
+  )
+
+#### Cleaning the equipment names
+listEquipdt  <-   listEquipdt %>% 
+  mutate(`If Yes, no and List of equipment indicated to have prolonged equipment downtime`  =  recode(`If Yes, no and List of equipment indicated to have prolonged equipment downtime`,
+        # old                    # New
+    "HUMALYTE PLUS"  =  "HUMAN DIAGNOSTICS",                                                                         
+    "CENTRIFUGE HAS BEEN DOWN FOR 6 MONTHS BUT THE FACILITY GOT A BACKUP CENTRIFUGE"  =  "CENTRIFUGE",       
+    "MICROSCOPE HAS BEEN DOWN FOR 1 YEAR BUT THEY HAVE A BACKUP MICROSCOPE THAT THERE USING"  =  "MICROSCOPE",
+    "CBC HUMSTART 60 TS"        =  "HUMAN DIAGNOSTICS",                               
+    "HUMALYTE PLUS THIS HAS SPENT 2 YEARS WITHOUT WORKING"   =  "HUMAN DIAGNOSTICS",                                
+    "HUMASTER 200"    =  "HUMAN DIAGNOSTICS",                                                                        
+    "HUMASTAR 80 FOR CHEMISTRY"  =  "HUMAN DIAGNOSTICS",                                                            
+    "M-PIMA MACHINE FOR HIV VIRAL LOAD"    =   "M-PIMA",                                                  
+    "HUMALYTE PLUS CHEMISTRY 01"    =  "HUMAN DIAGNOSTICS",                                                          
+    "MICROBIOLOGY BACTEC 01"    =  "BATEC",                                                                
+    "CHEMISTRY ELISYU NO"      =  "ELISYS UNO",                                                               
+    "BIOSAFETY CABINET"   =  "BSC",                                                                     
+    "PIMA MACHINE"        =  "M-PIMA",  
+    "HUMASTAR 80 (CHEMISTRY ANALYSER)"  = "HUMAN DIAGNOSTICS",                                                     
+    "REFRIDGERATOR 2"    =  "FRIDGE",                                                                       
+    "MPIIMA"   =  "M-PIMA",                                                                                 
+    "HUMASTAR 80 CHEMISTRY ANALYSER"    = "HUMAN DIAGNOSTICS",                                                     
+    "CHEMISTRY ANALYZER FAULTY FOR OVER A YEAR"  = "HUMAN DIAGNOSTICS",                                             
+    "REFER LIVER FUNCTION TEST TO NEAREST HOSPITAL KYENJOJO"   =  "NOT SPECIFIC",                                
+    "ABBOTT RUBY" = "ABBOTT",                                                                           
+    "BIOSAFETY CABINET-BIOBASE"   =  "BSC",                                                             
+    "NOT APPLICABLE"     =   "NA",
+    "BLOOD BANK REFRIGERATOR (6 MONTHS)"   =  "FRIDGE",                                                   
+    "SOLAR FRIDGE (8 MONTHS) CENTRIFUGE (2 YEARS)"  =  "SOLAR FRIDGE",                                        
+    "BD FACS PRESTO (4 MONTHS)"   =  "BD FACS PRESTO",                                                            
+    "1 EQUIPMENT"   =  "NOT SPECIFIC",                                                                          
+    "CBC MACHINE"    =    "HUMAN DIAGNOSTICS",                                                                       
+    "CHEMISTRY MACHINE"   =  "HUMAN DIAGNOSTICS",                                                                  
+    "SERVICE ENGINEER DON'T PUT STICKERS ON THE EQUIPMENT AFTER SERVICING"  =  "NOT SPECIFIC",                  
+    "2 EQUIPMENT"    =  "NOT SPECIFIC",                                                                          
+    "REFRIGERATOR"     =  "FRIDGE",                                                                       
+    "BIOSAFETY CABINET (BSC)"    =  "BSC",                                                           
+    "02 EQUIPMENT"    =  "NOT SPECIFIC",                                                                       
+    "ELECTROLYTE"   =  "HUMAN DIAGNOSTICS",
+    "SYSMEX XN 550"    =  "SYSMEX MACHINES",
+    "SYSMEX XN550"     =  "SYSMEX MACHINES"
+  ))
+
+#### %age of sites reporting the indicated unscheduled servicing
+hflistEquipdt  <-   listEquipdt %>%
+  filter(Yr == "2026") %>% 
+  group_by(`If Yes, no and List of equipment indicated to have prolonged equipment downtime`) %>% 
+  summarise(
+    No.sites_withLongDT  =   n()
+  ) %>% 
+  arrange(desc(No.sites_withLongDT )) %>% 
+  filter(!`If Yes, no and List of equipment indicated to have prolonged equipment downtime` %in%
+           c(NA,"","NA","N/A","1","A","N")) %>% 
+      rename(
+        "Equipment Category with >30 Day downtime"  =  "If Yes, no and List of equipment indicated to have prolonged equipment downtime"
+      )
+
+#### Report - sites reporting long downtime equipment by RRH ####
+RRHhflistEquipdt   <-   listEquipdt %>%
+  filter(Yr == "2026") %>% 
+  filter(`If Yes, no and List of equipment indicated to have prolonged equipment downtime` != "02") %>% 
+  group_by(RRH,`If Yes, no and List of equipment indicated to have prolonged equipment downtime`) %>% 
+  summarise(
+    No.sites_withLongDT  =   n(),
+    .groups = "drop"
+  ) %>% 
+  filter(!`If Yes, no and List of equipment indicated to have prolonged equipment downtime` %in%
+           c(NA,"","NA","N/A"))  %>% 
+  rename(
+    "Equipment Category with >30 Day downtime"  =  "If Yes, no and List of equipment indicated to have prolonged equipment downtime"
+  ) 
+  
+#### Re arrange the data frame
+RRHhflistdtPvt <-  RRHhflistEquipdt %>% 
+  pivot_wider(
+    names_from = `Equipment Category with >30 Day downtime`,
+    values_from = No.sites_withLongDT
+  ) %>% 
+  left_join(sitesDash, by = "RRH") %>% 
+  select(RRH, No.SitesVisited, everything())
+
+
+#### Report - Equipment detailed data ####
+equipdtl   <-  listEquipdt %>% 
+  select(RRH, District, HFacility, LEVEL, VDate, 
+         `The facility has non-functional equipment`,
+         `If Yes, the Number and List of Non-functional equipment`,
+         `Facility has equipment not serviced as scheduled`,
+         `If Yes, No. and List of equipment not be serviced as scheduled`,
+         `Facility experienced prolonged equipment downtime (more than 30 days) in the 6 months preceding this visit`,
+         `If Yes, no and List of equipment indicated to have prolonged equipment downtime`
+         )
+#### Report - Equipment action points tracker ####
+
+#### step 1
+equiptracker1 <-   equip %>% 
+  select(RRH,District, HFacility,VDate,20:23)
+# rename column names
+colnames(equiptracker1) <- c("RRH", "District", "HFacility","VDate", "Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### step 2
+equiptracker2 <-   equip %>% 
+  select(RRH,District, HFacility,VDate,25:28)
+# rename column names
+colnames(equiptracker2) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### step 3
+equiptracker3 <-   equip %>% 
+  select(RRH,District, HFacility,VDate,30:33)
+# rename column names
+colnames(equiptracker3) <- c("RRH", "District", "HFacility","VDate", "Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### step 4
+equiptracker4 <-   equip %>% 
+  select(RRH,District, HFacility,VDate,35:38)
+# rename column names
+colnames(equiptracker4) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### step 5
+equiptracker5 <-   equip %>% 
+  select(RRH,District, HFacility,VDate,40:43)
+# rename column names
+colnames(equiptracker5) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+
+#### combine the data frames
+equiptrackerRpt <- rbind(equiptracker1, equiptracker2, equiptracker3, equiptracker4, equiptracker5)
+
+#### filter rows without gaps
+equiptrackerRpt1   <-  equiptrackerRpt %>% 
+  filter(!is.na(`Identified Gap`)) %>% 
+  arrange(RRH,District,HFacility,VDate)%>% 
+  mutate(
+    Section = "Service Delivery"
+  )
+
+#### clean the Timelines, using "clean_deadlines" function
+equiptrackerRpt1   <-  equiptrackerRpt1 %>% 
+  mutate(
+    VDate_date = as.Date(VDate),
+    due_date = do.call(
+      c,
+      map2(
+        Timelines, VDate_date,
+        ~ clean_deadlines(.x, ref_date = .y, month_deadline = "last_day")$due_date
+      )
+    ),
+    ActionMonth = month(due_date, label = TRUE, abbr = TRUE),
+    ActionYr    = year(due_date)
+  )
+
+
+#### the table
+tble_equiptrackerRpt  <-   flextable(equiptrackerRpt)
+
+tble_equiptrackerRpt
+#### format the table
+tble_equiptrackerRpt  <-  tble_equiptrackerRpt %>% 
+  theme_vanilla() %>%  # Optional: Apply a minimal theme
+  fontsize(size = 9, part = "all") %>%  # Reduce font size
+  line_spacing(space = 1.0) %>%  # Minimize row spacing
+  padding(padding = 2, part = "all") %>%  # Reduce padding
+  width(j = c("Identified Gap", "Agreed Action Point", "Institution Responsible"), width = 6
+        )  # Adjust column width
+
+
+tble_equiptrackerRpt  <-  tble_equiptrackerRpt %>%  
+  vline(j=c(1,2,3,4,5,6,7), part = "all")
+# Display the table
+
+tble_equiptrackerRpt  <-  tble_equiptrackerRpt %>%  
+  add_header_row(values = "Equipment Mgt action tracker",
+                 colwidths = ncol(equiptrackerRpt))
+
+tble_equiptrackerRpt
+
+#######################################################################
+########################################################################
+#### QMS ####
+QMS  <-  SSW %>% 
+  select(District,HFacility,LEVEL,VDate,127:167,404:406, 408)
+  
+#### Report - QMS enrollment ####
+QMSenroll  <-  QMS %>% 
+  filter(Yr == "2026") %>% 
+  filter(`Facility is Accredited or Certified and has maintained accreditation, certification` %in% c("N", "Partial")) %>% 
+  summarise(
+    Indicator      =  "%age of non-accredited, certified labs enrolled onto a lab QMS program",
+    No.sites        = n_distinct(HFacility),
+    ReportedSites  =  sum(`If not, Health facility is enrolled on a QMS support program, LQMS, SLMTA` %in% c("Y", "Partial"), na.rm = TRUE),
+  ) %>% 
+  mutate(
+    `%age of sites` = round((ReportedSites/No.sites)*100,0)
+  )
+
+#### Report - %age of enrolled sites audited in last 12 months ####
+QMSaudit  <-  QMS %>% 
+  filter(Yr == "2026") %>% 
+  filter(`Facility is Accredited or Certified and has maintained accreditation, certification` %in% c("N", "Partial")) %>% 
+  summarise(
+    Indicator      =  "%age of non-accredited labs with QMS audited in the last 12 months",
+    No.sites        =  sum(`If not, Health facility is enrolled on a QMS support program, LQMS, SLMTA` %in% c("Y", "Partial")),
+    ReportedSites  =  sum(`The facility's QMS was audited at least once in the 12 months preceding this visit` == "Y"),
+  ) %>% 
+  mutate(
+    `%age of sites` = round((ReportedSites/No.sites)*100,0)
+  )
+
+#### Report - %age of audited sites with improving scores in succesive audits ####
+QMSscores  <-  QMS %>% 
+  filter(Yr == "2026") %>% 
+  filter(`Facility is Accredited or Certified and has maintained accreditation, certification` %in% c("N", "Partial")) %>% 
+  summarise(
+    Indicator      =  "%age of sites with improving audit scores in succesive audits",
+    No.sites        =  sum(`The facility's QMS was audited at least once in the 12 months preceding this visit` == "Y"),
+    ReportedSites  =  sum(`Facility’s' QMS improving (Improving QMS audit scores, Internal Audit findings)` == "Y"),
+  ) %>% 
+  mutate(
+    `%age of sites` = round((ReportedSites/No.sites)*100,0)
+  )
+
+#### Report - RRH QMS enrollment ####
+RRHQMSenroll  <-  QMS %>% 
+  filter(Yr == "2026") %>% 
+  filter(`Facility is Accredited or Certified and has maintained accreditation, certification` %in% c("N", "Partial")) %>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility),
+    No.enrolled  =  sum(`If not, Health facility is enrolled on a QMS support program, LQMS, SLMTA` %in% c("Y", "Partial"), na.rm = TRUE),
+    QMSAudited   = sum(`The facility's QMS was audited at least once in the 12 months preceding this visit`%in% c("Y", "Partial"), na.rm = TRUE),
+    ImproveScore  =  sum(`Facility’s' QMS improving (Improving QMS audit scores, Internal Audit findings)`%in% c("Y", "Partial"), na.rm = TRUE)
+  ) 
+#### Calculate the proportions
+RRHQMSenroll  <-  RRHQMSenroll %>% 
+  rowwise() %>%
+  mutate(
+    Pct_enrolled  =  paste0(No.enrolled,"/",No.sites, "(",
+                            round((No.enrolled/No.sites)*100,0), ")"),
+                            
+    Pct_QMSAudited  =  paste0(QMSAudited,"/",No.enrolled, "(",
+                              round((QMSAudited/No.enrolled)*100,0), ")"),
+                              
+    
+    Pct_ImproveScore  =   paste0(ImproveScore,"/",QMSAudited, "(",
+                                 round((ImproveScore/QMSAudited)*100,0), ")")
+                 ) %>% 
+            select(RRH, starts_with("Pct"))
+
+
+#### Report - Line list of facilities QMS performance ####
+HfacQMS  <-  QMS %>% 
+  filter(Yr == "2026") %>% 
+  filter(`Facility is Accredited or Certified and has maintained accreditation, certification` %in% c("N", "Partial")) %>% 
+  select(
+    RRH, District, HFacility, LEVEL, VDate,Yr,
+    `If not, Health facility is enrolled on a QMS support program, LQMS, SLMTA`,
+    `The facility's QMS was audited at least once in the 12 months preceding this visit`,
+    `Facility’s' QMS improving (Improving QMS audit scores, Internal Audit findings)`
+      ) %>% 
+  rename(
+    "Lab is enrolled onto a QMS Program" = "If not, Health facility is enrolled on a QMS support program, LQMS, SLMTA",
+    "Lab is audited at least one in the 12 months preceding this Supervision Visit" = "The facility's QMS was audited at least once in the 12 months preceding this visit",
+    "Lab registered improving audit scores between succesive QMS Audits"  =  "Facility’s' QMS improving (Improving QMS audit scores, Internal Audit findings)"
+    )
+
+########################################################################
+########################################################################
+#### Report - Lab tests enrolled onto EQA ####
+labtest_EQA  <-  QMS %>% 
+  filter(Yr == "2026") %>% 
+    summarise(
+    Indicator  =  "%age of labs with all major tests enrolled onto an EQA Scheme",
+    No.sites   =  n_distinct(HFacility),
+    ReportedSites  =  sum(`All facility's key lab tests enrolled onto EQA scheme` == "Y", na.rm = TRUE)
+    
+  ) %>% 
+  mutate(
+    `%age of sites`  =  round((ReportedSites/No.sites)*100,0)
+  )
+
+#### Report - tests enrolled onto EQA by RRH #### 
+RRHlabtest_EQA  <-  QMS %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility),
+    No.alltests  =  sum(`All facility's key lab tests enrolled onto EQA scheme` == "Y", na.rm = TRUE)
+    
+  ) %>% 
+  rowwise() %>% 
+  mutate(
+    Pct_allTests  =  round((No.alltests/No.sites)*100,0)
+  )
+
+
+#### Report - Lab tests not on EQA ####
+#### cleaning the data set
+QMS$`If not, indicate the number and list the tests not enrolled EQA` <-
+  toupper(QMS$`If not, indicate the number and list the tests not enrolled EQA`)
+
+### CLEANING
+# Separate values by comma, period, and "and", then remove numbers
+eqaTESTS   <-  QMS %>%
+  separate_rows(`If not, indicate the number and list the tests not enrolled EQA`, 
+                sep = ",|\\.| AND ")
+
+#### trim the names
+eqaTESTS$`If not, indicate the number and list the tests not enrolled EQA`<-
+  trimws(eqaTESTS$`If not, indicate the number and list the tests not enrolled EQA`
+  )
+
+#### Cleaning the equipment names
+eqaTESTS1  <-   eqaTESTS %>% 
+  mutate(`If not, indicate the number and list the tests not enrolled EQA`  
+         =  recode(`If not, indicate the number and list the tests not enrolled EQA`,
+"PREGNANCY" =     "URINE HCG",
+"MALARIA BS"       =  "MALARIA MICROSCOPY",                             
+"URINE MICRSOCOPY"   = "URINALYSIS",                
+"MALARIA MICRSOCPY"    =  "MALARIA MICROSCOPY",                       
+"CBC CHEMISTRY"     =   "CBC",                           
+"CBC NOT ENROLLED"       =  "CBC",                      
+"B/S FOR MALARIA PARASITES"   =   "MALARIA MICROSCOPY",             
+"RDT MALARIA"         =  "MALARIA RDT",                      
+"10 TEST NOT ENROLLED ON EQA" =   "NOT SPECIFIC",              
+"MALARIA"           =   "MALARIA MICROSCOPY",                        
+"SICKLING TEST"     =  "SCD",                           
+"GRAM STAIN"              =  "GRAM",                  
+"URINE ANALYSIS"          = "URINALYSIS",
+"11 TESTS; HCG"          =   "HCG",                        
+"B/S FOR MALARIA"       =   "MALARIA MICROSCOPY",                        
+"HB ESTIMATION"     =  "HB",                                
+"RBS/FBS"           = "RBS",                        
+"SERUM CRAG"      =  "CRAG",                           
+"URINE"           = "URINALYSIS",
+"3 TESTS"       =  "NOT SPECIFIC",                                
+"LFTS"          =  "LFT",                             
+"RFTS"          =  "RFT",
+"CHEMISTRY"     =  "CBC",
+"NONE"          = "ALL",
+ "All"         =   "ALL"
+))
+#### Report - national %age of sites without EQA ####
+hfeqaTESTS   <-   eqaTESTS1 %>%
+     filter(Yr == "2024") %>% 
+     group_by(`If not, indicate the number and list the tests not enrolled EQA`) %>% 
+     summarise(
+       No.sites_withoutEQA  =   n()
+     ) %>% 
+     arrange(desc(No.sites_withoutEQA)) %>% 
+     filter(!`If not, indicate the number and list the tests not enrolled EQA` %in%
+              c(NA,"","NA","N/A","A","6","3","N",
+                "ALL TESTS ON THE SCOPE ARE ENROLLED ON EQA")
+            ) %>% 
+          rename(
+            "Tests Not enrolled onto an EQA Scheme" = "If not, indicate the number and list the tests not enrolled EQA"
+          )
+   
+  
+#### Report - RRH %age of sites without EQA ####
+rrheqaTESTS   <-   eqaTESTS1 %>%
+  filter(Yr == "2026") %>% 
+  group_by(RRH, `If not, indicate the number and list the tests not enrolled EQA`) %>% 
+  summarise(
+    No.sites_withoutEQA  =   n()
+  ) %>% 
+  arrange(desc(No.sites_withoutEQA)) %>% 
+  filter(!`If not, indicate the number and list the tests not enrolled EQA` %in%
+           c(NA,"","NA","N/A","A","6","3","N",
+             "ALL TESTS ON THE SCOPE ARE ENROLLED ON EQA")
+  ) 
+
+#### Report -  EQA Gaps and Recommendations ####
+
+dfQMSGaps <- QMS %>%
+     mutate(themeQMSGaps_reasons = case_when(
+       str_detect(`Other gaps, recommendations...222`, "SOPs|ISO|IQC") ~ "No methodology standardisation",
+       str_detect(`Other gaps, recommendations...222`, "participation|corrective|cause|DELAY|`reports not available`|`Late delivery`|RCA|`not done`|feedback") ~ "No provider, Ineffective EQA systems/corrective action",
+       str_detect(`Other gaps, recommendations...222`, "staff|personel|training") ~ "Inadequate/incapacitated HR",
+       str_detect(`Other gaps, recommendations...222`, "materials|Stock") ~ "Stock-outs",
+       str_detect(`Other gaps, recommendations...222`, "EAFIA") ~ "LIMS not conforming to ISO standard",
+           TRUE ~ "Other"
+     ))
+#### the frequencies
+dfQMSGaps %>%
+     filter(!is.na(`Other gaps, recommendations...222`)) %>% 
+     count(`Other gaps, recommendations...222`) %>%
+     arrange(desc(n))
+   
+
+#### Report - EQA Action tracker ####
+#### step 1
+QMStracker1 <-   QMS %>% 
+  select(RRH,District, HFacility,VDate, 23:26)
+# rename column names
+colnames(QMStracker1) <- c("RRH", "District", "HFacility","VDate", "Identified Gap",
+                             "Agreed Action Point", "Institution Responsible", 
+                             "Timelines")
+
+#### step 2
+QMStracker2 <-   QMS %>% 
+  select(RRH,District, HFacility,VDate,28:31)
+# rename column names
+colnames(QMStracker2) <- c("RRH", "District", "HFacility","VDate", "Identified Gap",
+                             "Agreed Action Point", "Institution Responsible", 
+                             "Timelines")
+
+#### step 3
+QMStracker3 <-   QMS %>% 
+  select(RRH,District, HFacility,VDate,33:36)
+# rename column names
+colnames(QMStracker3) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                             "Agreed Action Point", "Institution Responsible", 
+                             "Timelines")
+
+#### step 4
+QMStracker4 <-   QMS %>% 
+  select(RRH,District, HFacility,VDate,38:41)
+# rename column names
+colnames(QMStracker4) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                             "Agreed Action Point", "Institution Responsible", 
+                             "Timelines")
+
+#### step 5
+QMStracker5 <-   QMS %>% 
+  select(RRH,District, HFacility,VDate,43:46)
+# rename column names
+colnames(QMStracker5) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                             "Agreed Action Point", "Institution Responsible", 
+                             "Timelines")
+
+
+#### combine the data frames
+
+QMStrackerRpt <- rbind(QMStracker1, QMStracker2, QMStracker3, QMStracker4, QMStracker5)
+
+#### filter rows without gaps
+QMStrackerRpt1   <-  QMStrackerRpt %>% 
+  filter(!is.na(`Identified Gap`)) %>% 
+  arrange(RRH,District,HFacility)%>% 
+  mutate(
+    Section = "QMS"
+  )
+
+#### clean the Timelines, using "clean_deadlines" function
+QMStrackerRpt1   <-  QMStrackerRpt1 %>% 
+  mutate(
+    VDate_date = as.Date(VDate),
+    due_date = do.call(
+      c,
+      map2(
+        Timelines, VDate_date,
+        ~ clean_deadlines(.x, ref_date = .y, month_deadline = "last_day")$due_date
+      )
+    ),
+    ActionMonth = month(due_date, label = TRUE, abbr = TRUE),
+    ActionYr    = year(due_date)
+  )
+
+#### the table
+tble_QMStrackerRpt  <-   flextable(QMStrackerRpt)
+
+#### format the table
+tble_QMStrackerRpt  <-  tble_QMStrackerRpt %>% 
+  theme_vanilla() %>%  # Optional: Apply a minimal theme
+  fontsize(size = 9, part = "all") %>%  # Reduce font size
+  line_spacing(space = 0.5) %>%  # Minimize row spacing
+  padding(padding = 2, part = "all") %>%  # Reduce padding
+  width(j = c("Identified Gap", "Agreed Action Point", "Institution Responsible"), width = 6
+  )  # Adjust column width
+
+
+tble_QMStrackerRpt  <-  tble_QMStrackerRpt %>% 
+  vline(j=c(1,2,3,4,5,6,7), part = "all")
+# Display the table
+
+tble_QMStrackerRpt  <-  tble_QMStrackerRpt %>% 
+  add_header_row(values = "QMS action tracker",
+                 colwidths = ncol(QMStrackerRpt))
+
+tble_QMStrackerRpt
+
+#################################################################
+#################################################################
+#### Bio safety Bio Security ####
+#### the data set
+bsbs  <-  SSW %>% 
+  select(District,HFacility,LEVEL,VDate,169:208,404:408)
+
+#### rename columns
+bsbs  <-  bsbs %>% 
+  rename(
+    # New              #Old
+    "BRM_assessments"     =   "The facility performs routine Bio Risk Management internal audits, and or, bio-risk management assessments",
+    "missingBRMPractices"  =  "If not, list the BRM basics not implemented",
+    "Correct_wasteMgr"    =   "Facility performs effective Waste Management:  Infectious waste correctly disposed; Waste areas correctly managed; Clear segregation practices (waste decontaminated before disposal, waste storage area secured from public and environment, proper use of waste bin colours)",
+    "missing_wastePractices"  =  "If no, or partial, list the waste management practices missing in the facility",
+    "Functional_incinarator_contractor"  =  "Facility has a functional incinerator / or with a running contract with a biowaste company",                                                                                                                                                                                    
+    "waste_recorded"    =  "The facility records waste produced"
+    )
+
+#### Report - effective BSBS practices ####
+bsbsPractices   <-  bsbs %>% 
+  filter(Yr == "2026") %>% 
+   summarise(
+    No.sites   =  n_distinct(HFacility),
+    No.performsBRM_audit  =  sum(BRM_assessments %in% c("Y", "Partial")),
+    No.perform_CrtWasteMgt   = sum(Correct_wasteMgr%in% c("Y", "Partial")),
+    No.fntlIncinerator_cntr  =  sum(Functional_incinarator_contractor %in% c("Y", "Partial"))
+  ) %>% 
+  mutate(
+    Pct_performsBRM_audit  =  round((No.performsBRM_audit/No.sites)*100,0),
+    Pct_perform_CrtWasteMgt  =  round((No.perform_CrtWasteMgt/No.sites)*100,0),
+    Pct_fntlIncinerator_cntr  =  round((No.fntlIncinerator_cntr/No.sites)*100,0),
+  )
+
+#### Report - %age of labs performing BRM Audits (Internal or External) ####
+brmAudit  <-  bsbsPractices %>% 
+  mutate(
+    Indicator  = "%age of sites performing BRM Audits (Internal or External)"
+  ) %>% 
+  select(Indicator, No.sites, No.performsBRM_audit, Pct_performsBRM_audit
+         ) %>% 
+  rename(
+    "ReportedSites"   =   "No.performsBRM_audit",
+    "%age of sites"   =   "Pct_performsBRM_audit"
+  )
+
+#### report - %age labs with correct waste mgt practices ####
+brmwaste  <-  bsbsPractices %>% 
+  mutate(
+    Indicator  = "%age of labs performing correct waste mgt practices"
+  ) %>% 
+  select(Indicator, No.sites, No.perform_CrtWasteMgt, Pct_perform_CrtWasteMgt
+  ) %>% 
+  rename(
+    "ReportedSites"   =   "No.perform_CrtWasteMgt",
+    "%age of sites"   =   "Pct_perform_CrtWasteMgt"
+  )
+
+#### report - %age labs with sites with functional incinerator or with running contract with waste collector co.####
+brmincin  <-  bsbsPractices %>% 
+  mutate(
+    Indicator  = "%age of labs with functional incinerator or with running contract with waste collector"
+  ) %>% 
+  select(Indicator, No.sites, No.fntlIncinerator_cntr, Pct_fntlIncinerator_cntr
+  ) %>% 
+  rename(
+    "ReportedSites"   =   "No.fntlIncinerator_cntr",
+    "%age of sites"   =   "Pct_fntlIncinerator_cntr"
+  )
+
+
+#### Report   - Effective BSBS practices by RRH ####
+RRHbsbsPractices   <-  bsbs %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility),
+    No.performsBRM_audit  =  sum(BRM_assessments %in% c("Y", "Partial")),
+    No.perform_CrtWasteMgt   = sum(Correct_wasteMgr%in% c("Y", "Partial")),
+    No.fntlIncinerator_cntr  =  sum(Functional_incinarator_contractor %in% c("Y", "Partial"))
+  ) %>% 
+  mutate(
+    Pct_performsBRM_audit  =  round((No.performsBRM_audit/No.sites)*100,0),
+    Pct_perform_CrtWasteMgt  =  round((No.perform_CrtWasteMgt/No.sites)*100,0),
+    Pct_fntlIncinerator_cntr  =  round((No.fntlIncinerator_cntr/No.sites)*100,0),
+  )
+
+#### Rerport - Linelist of labs BRM practices ####
+hfbmrlst  <-  bsbs %>% 
+  select(
+    RRH, District, HFacility, LEVEL,VDate, Yr, BRM_assessments, Correct_wasteMgr, Functional_incinarator_contractor
+  )
+
+#### Report - BRM practices not implemented ####
+bsbs$missingBRMPractices <-
+  toupper(bsbs$missingBRMPractices)
+
+### CLEANING
+# Separate values by comma, period, and "and", then remove numbers
+bsbsMissingPrac   <-  bsbs %>%
+  separate_rows(missingBRMPractices, 
+                sep = ",|\\.| AND ")
+### removing space before
+bsbsMissingPrac$missingBRMPractices   <-  trimws(bsbsMissingPrac$missingBRMPractices
+                                                 )
+#### creating themes for the missing practices
+bsbs_poor <- bsbsMissingPrac %>%
+  mutate(bsbsPoorPrac = case_when(
+    str_detect(missingBRMPractices, "RISK|ASSESSMENTS|BIORISK") ~ "Routine Risk Management",
+    str_detect(missingBRMPractices, "AUDITS|AUDIT|BRM") ~ "External and Internal Audits",
+    str_detect(missingBRMPractices, "WASTE|REAGENTS|WEIGHING") ~ "Waste mgt practices",
+    str_detect(missingBRMPractices, "SAFETY|DRILLS|ALARM") ~ "Missing safety drills",
+    str_detect(missingBRMPractices, "TRAINED") ~ "No,inadequate capacity building",
+      TRUE ~ "Other"
+  ))
+
+#### the frequencies
+#### select the columns of interest
+bsbs_poorfreq   <-  bsbs_poor %>% 
+    select(missingBRMPractices,bsbsPoorPrac)
+
+### cleaning the practices indicated
+bsbs_poorfreq <- bsbs_poorfreq %>% 
+  filter(!missingBRMPractices %in% c("NA", "N/A", "N", "A",""))
+
+#### remove NA
+bsbs_poorfreq <- bsbs_poorfreq %>%
+  filter(!is.na(missingBRMPractices))
+
+#### arraneg most common
+bsbs_poorfreqRpt <- bsbs_poorfreq %>%   
+  group_by(bsbsPoorPrac) %>%
+  summarise(N = n(), .groups = "drop") %>% 
+  arrange(desc(N))
+
+#### Report - BRM best practices not implemented by RRH ####
+RRHbsbs_poor   <-  bsbs_poor %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH, missingBRMPractices, missing_wastePractices) 
+
+#### Report - BSBS Action Tracker ####
+#### step 1
+bsbstracker1 <-   bsbs %>% 
+  select(RRH,District, HFacility,VDate, 20:23)
+# rename column names
+colnames(bsbstracker1) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                           "Agreed Action Point", "Institution Responsible", 
+                           "Timelines")
+
+#### step 2
+bsbstracker2 <-   bsbs %>% 
+  select(RRH,District, HFacility,VDate,25:28)
+# rename column names
+colnames(bsbstracker2) <- c("RRH", "District", "HFacility", "VDate", "Identified Gap",
+                           "Agreed Action Point", "Institution Responsible", 
+                           "Timelines")
+
+#### step 3
+bsbstracker3 <-   bsbs %>% 
+  select(RRH,District, HFacility,VDate,30:33)
+# rename column names
+colnames(bsbstracker3) <- c("RRH", "District", "HFacility","VDate", "Identified Gap",
+                           "Agreed Action Point", "Institution Responsible", 
+                           "Timelines")
+
+#### step 4
+bsbstracker4 <-   bsbs %>% 
+  select(RRH,District, HFacility,VDate,35:38)
+# rename column names
+colnames(bsbstracker4) <- c("RRH", "District", "HFacility","VDate", "Identified Gap",
+                           "Agreed Action Point", "Institution Responsible", 
+                           "Timelines")
+
+#### step 5
+bsbstracker5 <-   bsbs %>% 
+  select(RRH,District, HFacility,VDate,40:43)
+# rename column names
+colnames(bsbstracker5) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                           "Agreed Action Point", "Institution Responsible", 
+                           "Timelines")
+
+
+#### combine the data frames
+
+bsbstrackerRpt <- rbind(bsbstracker1, bsbstracker2, bsbstracker3, bsbstracker4, bsbstracker5
+                        )
+
+#### filter rows without gaps
+bsbstrackerRptRpt1   <-  bsbstrackerRpt %>% 
+  filter(!is.na(`Identified Gap`)) %>% 
+  arrange(RRH,District,HFacility)%>% 
+  mutate(
+    Section = "BSBS"
+  )
+
+#### clean the Timelines, using "clean_deadlines" function
+bsbstrackerRptRpt1   <-  bsbstrackerRptRpt1 %>% 
+  mutate(
+    VDate_date = as.Date(VDate),
+    due_date = do.call(
+      c,
+      map2(
+        Timelines, VDate_date,
+        ~ clean_deadlines(.x, ref_date = .y, month_deadline = "last_day")$due_date
+      )
+    ),
+    ActionMonth = month(due_date, label = TRUE, abbr = TRUE),
+    ActionYr    = year(due_date)
+  )
+
+
+
+
+#### the table
+tble_bsbstrackerRpt  <-   flextable(bsbstrackerRptRpt)
+
+#### format the table
+tble_bsbstrackerRpt  <-  tble_bsbstrackerRpt %>% 
+  theme_vanilla() %>%  # Optional: Apply a minimal theme
+  fontsize(size = 9, part = "all") %>%  # Reduce font size
+  line_spacing(space = 1.0) %>%  # Minimize row spacing
+  padding(padding = 2, part = "all") %>%  # Reduce padding
+  width(j = c("Identified Gap", "Agreed Action Point", "Institution Responsible"), width = 6
+  )  # Adjust column width
+
+
+tble_bsbstrackerRpt  <-  tble_bsbstrackerRpt %>% 
+  vline(j=c(1,2,3,4,5,6,7), part = "all")
+# Display the table
+
+tble_bsbstrackerRpt   <-  tble_bsbstrackerRpt %>% 
+  add_header_row(values = "BSBS action tracker",
+                 colwidths = ncol(bsbstrackerRptRpt))
+
+tble_bsbstrackerRpt
+
+#####################################################################
+#### NSRTN #####
+#### NSRTN Data set
+NSRTN   <-  SSW %>% 
+  select(District,HFacility,LEVEL,VDate,209:248,404:407)
+
+#### renaming the columns
+NSRTNdf   <-   NSRTN %>% 
+  rename(
+    # New              # Old
+    "scheduledVst"     =   "The Hub rider / Sample transport vehicle reaches the facility as scheduled, and Backup Up Riders available for the hub",
+    "bike_service_fueled"  =  "If hub; Bikes are serviced as scheduled, with adequate fuel and data/internet bundles provided to ensure efficient, and effective running of the hub",
+    "TAT_withinTarget"    =  "Turnaround Time (TAT) between sample dispatch and results return is within targeted timelines",
+    "Refer_timely"        = "Facility refers samples within the allowable TAT (2 days from sample collection for routine HIV mgt, 12 hours for outbreak management)",
+    "RejtRate"            =  "The facility records acceptable rejection rates"
+  )
+
+##### Report - NSRTN functionality #####
+NSRTNdf1   <-   NSRTNdf %>% 
+  filter(Yr == "2026") %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility),
+    No.scheduledVst  =  sum(scheduledVst == "Y", na.rm = TRUE),
+    No.bike_service_fueled   = sum(bike_service_fueled == "Y", na.rm = TRUE),
+    No.TAT_withinTarget  =  sum(TAT_withinTarget == "Y", na.rm = TRUE),
+    No.timelyrefer     =  sum(Refer_timely == "Y", na.rm = TRUE),
+    No.RejtRate        =  sum(RejtRate == "Y", na.rm = TRUE)
+    ) %>% 
+  mutate(
+    Pct_scheduledVst  =  round((No.scheduledVst/No.sites)*100,0),
+    Pct_bike_service_fueled = round((No.bike_service_fueled/No.sites)*100,0),
+    Pct_TAT_withinTarget  =  round((No.TAT_withinTarget/No.sites)*100,0),
+    Pct_timelyrefer  =  round((No.timelyrefer/No.sites)*100,0),
+    Pct_RejtRate  =  round((No.RejtRate/No.sites)*100,0)
+  )
+
+#### Report - %age of labs with visited as scheduled ####
+Labsvits  <-  NSRTNdf1 %>% 
+  mutate(
+    Indicator  = "%age of labs with bike riders visiting as scheduled"
+  ) %>% 
+  select(Indicator, No.sites, No.scheduledVst, Pct_scheduledVst
+  ) %>% 
+  rename(
+    "ReportedSites"   =   "No.scheduledVst",
+    "%age of sites"   =   "Pct_scheduledVst"
+  )
+
+#### Report - %age of hubs with bikes serviced and fueled ####
+Labbkserd  <-  NSRTNdf1 %>% 
+  mutate(
+    Indicator  = "%age of labs with bike serviced and fueled"
+  ) %>% 
+  select(Indicator, No.sites, No.bike_service_fueled, Pct_bike_service_fueled
+  ) %>% 
+  rename(
+    "ReportedSites"   =   "No.bike_service_fueled",
+    "%age of sites"   =   "Pct_bike_service_fueled"
+  )
+#### Report - %age of labs receiving results within targeted TAT ####
+LabTAT  <-  NSRTNdf1 %>% 
+  mutate(
+    Indicator  = "%age of labs indicating to receive referred sample results within targeted TAT"
+  ) %>% 
+  select(Indicator, No.sites, No.TAT_withinTarget, Pct_TAT_withinTarget
+  ) %>% 
+  rename(
+    "ReportedSites"   =   "No.TAT_withinTarget",
+    "%age of sites"   =   "Pct_TAT_withinTarget"
+  )
+
+#### Report - %age of labs referring samples within targeted TAT ####
+Lab_referTAT  <-  NSRTNdf1 %>% 
+  mutate(
+    Indicator  = "%age of labs indicating to refer samples within targeted TAT"
+  ) %>% 
+  select(Indicator, No.sites, No.timelyrefer, Pct_timelyrefer
+  ) %>% 
+  rename(
+    "ReportedSites"   =   "No.timelyrefer",
+    "%age of sites"   =   "Pct_timelyrefer"
+  )
+
+#### Report - %age of labs recording acceptable rejection rates ####
+Lab_rejtn  <-  NSRTNdf1 %>% 
+  mutate(
+    Indicator  = "%age of labs recording acceptable rejection rates"
+  ) %>% 
+  select(Indicator, No.sites, No.RejtRate, Pct_RejtRate
+  ) %>% 
+  rename(
+    "ReportedSites"   =   "No.RejtRate",
+    "%age of sites"   =   "Pct_RejtRate"
+  )
+
+#### Report - %age of sites reached by sample transporter by RRH ####
+RRHNSRTNdf1   <-  NSRTNdf %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility),
+    
+    # Complete compliance
+    No.CscheVst  =  sum(scheduledVst == "Y", na.rm = TRUE),
+    
+    # Partial compliance
+    No.PscheVst  =  sum(scheduledVst == "P", na.rm = TRUE)
+    
+  ) %>% 
+  
+  mutate(
+    # Numeric indicators first
+    Pct_scheVst_num  = round((No.CscheVst / No.sites) * 100, 0),
+    
+    # weighted only when partial exists
+    
+    Weighted_Score_num  = ifelse(
+      No.PscheVst > 0, 
+      round(
+      ((No.CscheVst + (0.5 * No.PscheVst)) / No.sites) * 100, 0
+      ), NA),
+    
+    # Formatted display
+    `%age of sites with complete complaince`  = paste0(Pct_scheVst_num, "% (", No.CscheVst,"/",No.sites,")"),
+    
+    # only if partial exists
+    
+    `Status resulting from observed partial performance`  = ifelse(
+      No.PscheVst > 0,
+      paste0(
+        Weighted_Score_num, "% (", 
+        round(No.CscheVst + (0.5 * No.PscheVst),1), "/", No.sites, ")"
+      ),
+      "NA"
+    ),
+    # Interpretation
+    Interpretation = case_when(
+      Pct_scheVst_num  == 0 ~ "No lab met the target",
+      Pct_scheVst_num  == 100 ~ "All labs met target",
+      No.PscheVst == 0 & Pct_scheVst_num  < 100 ~ "Address the non-performing site(s)",
+      No.PscheVst > 0 ~ "Partial performance observed – address the site(s)",
+    )) %>% 
+    mutate(
+      Indicator  =  "%age of labs visited by sample transporter as scheduled",
+      # Flag: Number with Partial responses
+      Partial_Status_Observed = ifelse(No.PscheVst > 0, "Yes", "No")
+    ) %>% 
+  select(
+    RRH,  Indicator, `%age of sites with complete complaince`, Partial_Status_Observed,  `Status resulting from observed partial performance`, Interpretation    
+  )
+
+#### Report - %age of hubs with bike serviced and fueled RRH ####
+RRHNSRTNdf2   <-  NSRTNdf %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility),
+    
+    # Complete compliance
+    No.CbikeSerFuel  =  sum(bike_service_fueled == "Y", na.rm = TRUE),
+    
+    # Partial compliance
+    No.PbikeSerFuel  =  sum(bike_service_fueled == "P", na.rm = TRUE)
+    
+  ) %>% 
+  
+  mutate(
+    # Numeric indicators first
+    Pct_sercd_fueled  = round((No.CbikeSerFuel / No.sites) * 100, 0),
+    
+    # weighted only when partial exists
+    
+    Weighted_Score_num1  = ifelse(
+      No.PbikeSerFuel > 0, 
+      round(
+        ((No.CbikeSerFuel + (0.5 * No.PbikeSerFuel)) / No.sites) * 100, 0
+      ), NA),
+    
+    # Formatted display
+    `%age of sites with complete complaince`  = paste0(Pct_sercd_fueled, "% (", No.CbikeSerFuel,"/",No.sites,")"),
+    
+    # only if partial exists
+    
+    `Status resulting from observed partial performance`  = ifelse(
+      No.PbikeSerFuel > 0,
+      paste0(
+        Weighted_Score_num1, "% (", 
+        round(No.CbikeSerFuel + (0.5 * No.PbikeSerFuel),1), "/", No.sites, ")"
+      ),
+      "NA"
+    ),
+    # Interpretation
+    Interpretation = case_when(
+      Pct_sercd_fueled  == 0 ~ "No lab met the target",
+      Pct_sercd_fueled  == 100 ~ "All labs met target",
+      No.PbikeSerFuel == 0 & Pct_sercd_fueled  < 100 ~ "Address the non-performing site(s)",
+      No.PbikeSerFuel > 0 ~ "Partial performance observed – address the site(s)",
+      
+    )) %>% 
+  mutate(
+    Indicator  =  "%age of hubs with bikes timely serviced and fueled",
+    # Flag: Number with Partial responses
+    Partial_Status_Observed = ifelse(No.PbikeSerFuel > 0, "Yes", "None")
+  ) %>% 
+  select(
+    RRH,  Indicator, `%age of sites with complete complaince`, Partial_Status_Observed, `Status resulting from observed partial performance`, Interpretation    
+  )
+
+#### Report - %age sites indicating to have achieved TAT by RRH ####
+RRHNSRTNdf3   <-  NSRTNdf %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility),
+    
+    # Complete compliance
+    No.CTATinTarget  =  sum(TAT_withinTarget == "Y", na.rm = TRUE),
+    
+    # Partial compliance
+    No.PTATinTarget  =  sum(TAT_withinTarget == "P", na.rm = TRUE)
+    
+  ) %>% 
+  
+  mutate(
+    # Numeric indicators first
+    Pct_TATinTarget  = round((No.CTATinTarget / No.sites) * 100, 0),
+    
+    # weighted only when partial exists
+    
+    Weighted_Score_num2  = ifelse(
+      No.PTATinTarget > 0, 
+      round(
+        ((No.CTATinTarget + (0.5 * No.PTATinTarget)) / No.sites) * 100, 0
+      ), NA),
+    
+    # Formatted display
+    `%age of sites with complete complaince`  = paste0(Pct_TATinTarget, "% (", No.CTATinTarget,"/",No.sites,")"),
+    
+    # only if partial exists
+    
+    `Status resulting from observed partial performance`  = ifelse(
+      No.PTATinTarget > 0,
+      paste0(
+        Weighted_Score_num1, "% (", 
+        round(No.CTATinTarget + (0.5 * No.PTATinTarget),1), "/", No.sites, ")"
+      ),
+      "NA"
+    ),
+    # Interpretation
+    Interpretation = case_when(
+      Pct_TATinTarget  == 0 ~ "No lab met the target",
+      Pct_TATinTarget  == 100 ~ "All labs met target",
+      No.PTATinTarget == 0 & Pct_TATinTarget  < 100 ~ "Address the non-performing site(s)",
+      No.PTATinTarget > 0 ~ "Partial performance observed – address the site(s)",
+      
+    )) %>% 
+  mutate(
+    Indicator  =  "%age of labs indicating to attain the targeted Results receipt TAT",
+    # Flag: Number with Partial responses
+    Partial_Status_Observed = ifelse(No.PTATinTarget > 0, "Yes", "None")
+  ) %>% 
+  select(
+    RRH,  Indicator, `%age of sites with complete complaince`, Partial_Status_Observed, `Status resulting from observed partial performance`, Interpretation    
+  )
+
+
+#### Report - %age sites that timely refer by RRH ####
+RRHNSRTNdf4   <-  NSRTNdf %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility),
+    
+    # Complete compliance
+    No.CtimelyRefer  =  sum(Refer_timely == "Y", na.rm = TRUE),
+    
+    # Partial compliance
+    No.PtimelyRefer  =  sum(Refer_timely == "P", na.rm = TRUE)
+    
+  ) %>% 
+  
+  mutate(
+    # Numeric indicators first
+    Pct_TATinTarget  = round((No.CtimelyRefer / No.sites) * 100, 0),
+    
+    # weighted only when partial exists
+    
+    Weighted_Score_num3  = ifelse(
+      No.PtimelyRefer > 0, 
+      round(
+        ((No.CtimelyRefer + (0.5 * No.PtimelyRefer)) / No.sites) * 100, 0
+      ), NA),
+    
+    # Formatted display
+    `%age of sites with complete complaince`  = paste0(Pct_TATinTarget, "% (", No.CtimelyRefer,"/",No.sites,")"),
+    
+    # only if partial exists
+    
+    `Status resulting from observed partial performance`  = ifelse(
+      No.PtimelyRefer > 0,
+      paste0(
+        Weighted_Score_num1, "% (", 
+        round(No.CtimelyRefer + (0.5 * No.PtimelyRefer),1), "/", No.sites, ")"
+      ),
+      "NA"
+    ),
+    # Interpretation
+    Interpretation = case_when(
+      Pct_TATinTarget  == 0 ~ "No lab met the target",
+      Pct_TATinTarget  == 100 ~ "All labs met target",
+      No.PtimelyRefer == 0 & Pct_TATinTarget  < 100 ~ "Address the non-performing site(s)",
+      No.PtimelyRefer > 0 ~ "Partial performance observed – address the site(s)",
+      
+    )) %>% 
+  mutate(
+    Indicator  =  "%age of labs indicating to refer samples within targeted TAT",
+    # Flag: Number with Partial responses
+    Partial_Status_Observed = ifelse(No.PtimelyRefer > 0, "Yes", "None")
+  ) %>% 
+  select(
+    RRH,  Indicator, `%age of sites with complete complaince`, Partial_Status_Observed, `Status resulting from observed partial performance`, Interpretation    
+  )
+
+
+#### Report - %age sites with rejection rate within limit by RRH ####
+RRHNSRTNdf5   <-  NSRTNdf %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility),
+    
+    # Complete compliance
+    No.CRejetnRate  =  sum(RejtRate == "Y", na.rm = TRUE),
+    
+    # Partial compliance
+    No.PRejetnRate  =  sum(RejtRate == "P", na.rm = TRUE)
+    
+  ) %>% 
+  
+  mutate(
+    # Numeric indicators first
+    Pct_RejtRate  = round((No.CRejetnRate / No.sites) * 100, 0),
+    
+    # weighted only when partial exists
+    
+    Weighted_Score_num4  = ifelse(
+      No.PRejetnRate > 0, 
+      round(
+        ((No.CRejetnRate + (0.5 * No.PRejetnRate)) / No.sites) * 100, 0
+      ), NA),
+    
+    # Formatted display
+    `%age of sites with complete complaince`  = paste0(Pct_RejtRate, "% (", No.CRejetnRate,"/",No.sites,")"),
+    
+    # only if partial exists
+    
+    `Status resulting from observed partial performance`  = ifelse(
+      No.PRejetnRate > 0,
+      paste0(
+        Weighted_Score_num1, "% (", 
+        round(No.CRejetnRate + (0.5 * No.PRejetnRate),1), "/", No.sites, ")"
+      ),
+      "NA"
+    ),
+    # Interpretation
+    Interpretation = case_when(
+      Pct_RejtRate  == 0 ~ "No lab met the target",
+      Pct_RejtRate  == 100 ~ "All labs met target",
+      No.PRejetnRate == 0 & Pct_RejtRate  < 100 ~ "Address the non-performing site(s)",
+      No.PRejetnRate > 0 ~ "Partial performance observed – address the site(s)",
+      
+    )) %>% 
+  mutate(
+    Indicator  =  "%age of labs with acceptable rejection rates",
+    # Flag: Number with Partial responses
+    Partial_Status_Observed = ifelse(No.PRejetnRate > 0, "Yes", "None")
+  ) %>% 
+  select(
+    RRH,  Indicator, `%age of sites with complete complaince`, Partial_Status_Observed, `Status resulting from observed partial performance`, Interpretation    
+  )
+
+    
+
+
+#### Report - All RRH functionality ####
+rrhNSrtall  <-  bind_rows(RRHNSRTNdf1, RRHNSRTNdf2, RRHNSRTNdf3, 
+                          RRHNSRTNdf4,RRHNSRTNdf5)
+
+#### Report - Line list status ####
+NSRTNdfsta  <-  NSRTNdf %>% 
+  filter(Yr == "2026") %>% 
+  
+  select(RRH, Yr, District, HFacility, LEVEL, VDate,
+         scheduledVst, bike_service_fueled, TAT_withinTarget, Refer_timely,
+         RejtRate
+         )
+
+#### Report - NSRTN gaps and recommendations ####
+NSRTNdf3   <-   NSRTN %>% 
+  mutate(themensrtnGaps_reasons = case_when(
+    str_detect(`Other gaps, recommendations...301`, "packaging|haemolysed") ~ "Sample Quality",
+    str_detect(`Other gaps, recommendations...301`, "TAT|time ") ~ "Long delivery TAT",
+    str_detect(`Other gaps, recommendations...301`, "check|recommend|coordinator|capture") ~ "Recommendations",
+    str_detect(`Other gaps, recommendations...301`, "Delay|surveillance|Mpox") ~ "Dalays in outbreak results return",
+    str_detect(`Other gaps, recommendations...301`, "stationery|fuel|cards|stock|paper") ~ "Inadequate logistics,fuel",
+    str_detect(`Other gaps, recommendations...301`, "evidence|bundles") ~ "Poor sample movt accontability",
+    str_detect(`Other gaps, recommendations...301`, "arenot|servicing") ~ "Untimely bike servicing",
+    str_detect(`Other gaps, recommendations...301`, "Overload") ~ "Over equipment Utilization",
+    str_detect(`Other gaps, recommendations...301`, "ALIS") ~ "ICT ineffectiveness",
+    str_detect(`Other gaps, recommendations...301`, "insurance|contracts|Transportation|back") ~ "Lack of M/Bike riders contracts,insurance,back-up",
+    str_detect(`Other gaps, recommendations...301`, "working|repair") ~ "M-Bike breakdown",
+    TRUE ~ "Other"
+  ))
+
+#### remove recommendations
+NSRTNdf3 <- NSRTNdf3 %>%
+  filter(!themensrtnGaps_reasons %in% c("Recommendations", "Other"))
+
+### the graph
+# Pre-compute counts and wrap long labels
+NSRTNdf_plot <- NSRTNdf3 %>%
+  count(themensrtnGaps_reasons) %>%
+  mutate(
+    themensrtnGaps_reasons = str_wrap(themensrtnGaps_reasons, width = 30),  # Wrap long labels
+    themensrtnGaps_reasons = reorder(themensrtnGaps_reasons, n)
+  )
+
+# Plot
+ggplot(NSRTNdf_plot, aes(x = themensrtnGaps_reasons, y = n)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Most commonly mentioned NSRTN gaps",
+    x = "Theme",
+    y = "Count"
+  ) +
+  theme(
+    axis.text.y = element_text(size = 10)
+  )
+
+#### Report - NSRTN Action tracker ####
+#### step 1
+nsrtntracker1 <-   NSRTN %>% 
+  select(RRH,District, HFacility,VDate, 20:23)
+# rename column names
+colnames(nsrtntracker1) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                            "Agreed Action Point", "Institution Responsible", 
+                            "Timelines")
+
+#### step 2
+nsrtntracker2 <-   NSRTN %>% 
+  select(RRH,District, HFacility,VDate,25:28)
+# rename column names
+colnames(nsrtntracker2) <- c("RRH", "District", "HFacility","VDate", "Identified Gap",
+                            "Agreed Action Point", "Institution Responsible", 
+                            "Timelines")
+
+#### step 3
+nsrtntracker3 <-   NSRTN %>% 
+  select(RRH,District, HFacility,VDate,30:33)
+# rename column names
+colnames(nsrtntracker3) <- c("RRH", "District", "HFacility","VDate", "Identified Gap",
+                            "Agreed Action Point", "Institution Responsible", 
+                            "Timelines")
+
+#### step 4
+nsrtntracker4 <-   NSRTN %>% 
+  select(RRH,District, HFacility,VDate,35:38)
+# rename column names
+colnames(nsrtntracker4) <- c("RRH", "District", "HFacility","VDate", "Identified Gap",
+                            "Agreed Action Point", "Institution Responsible", 
+                            "Timelines")
+
+
+#### combine the data frames
+nsrtntrackerRpt <- rbind(nsrtntracker1, nsrtntracker2, nsrtntracker3, nsrtntracker4
+)
+
+#### filter rows without gaps
+nsrtntrackerRpt1   <-  nsrtntrackerRpt %>% 
+  filter(!is.na(`Identified Gap`)) %>% 
+  arrange(RRH,District,HFacility)%>% 
+  mutate(
+    Section = "nsrtn"
+  )
+
+#### clean the Timelines, using "clean_deadlines" function
+nsrtntrackerRpt1   <-  nsrtntrackerRpt1 %>% 
+  mutate(
+    VDate_date = as.Date(VDate),
+    due_date = do.call(
+      c,
+      map2(
+        Timelines, VDate_date,
+        ~ clean_deadlines(.x, ref_date = .y, month_deadline = "last_day")$due_date
+      )
+    ),
+    ActionMonth = month(due_date, label = TRUE, abbr = TRUE),
+    ActionYr    = year(due_date)
+  )
+
+
+
+#### the table
+tble_nsrtntrackerRpt1  <-   flextable(nsrtntrackerRpt1)
+
+#### format the table
+tble_nsrtntrackerRpt1  <-  tble_nsrtntrackerRpt1 %>% 
+  theme_vanilla() %>%  # Optional: Apply a minimal theme
+  fontsize(size = 9, part = "all") %>%  # Reduce font size
+  line_spacing(space = 1.0) %>%  # Minimize row spacing
+  padding(padding = 2, part = "all") %>%  # Reduce padding
+  width(j = c("Identified Gap", "Agreed Action Point", "Institution Responsible"), width = 6
+  )  # Adjust column width
+
+
+tble_nsrtntrackerRpt1  <-  tble_nsrtntrackerRpt1 %>% 
+  vline(j=c(1,2,3,4,5,6,7), part = "all")
+# Display the table
+
+tble_nsrtntrackerRpt1  <-  tble_nsrtntrackerRpt1 %>% 
+  add_header_row(values = "NSRTN action tracker",
+                 colwidths = ncol(nsrtntrackerRpt1))
+
+tble_nsrtntrackerRpt1
+
+####################################################################
+#####################################################################
+#### M&E ####
+ME   <-  SSW %>% 
+  select(District,HFacility,LEVEL,VDate,250:289,404:408)
+
+#### Report - LIMS used in the facility ####
+lims   <-  ME %>% 
+  filter(Yr == "2026") %>% 
+  group_by(`Type of LIMS used in facility`) %>% 
+  summarise(
+    sites   =  n(), .groups = "drop"
+       ) %>% 
+  mutate(
+    Pct_LIMS  =  round((sites/TotalSts)*100,0)
+  )
+
+#### Report - %age of labs using e-LIMS ####
+elims   <-   lims %>% 
+  filter(`Type of LIMS used in facility` == "e-LIMS") %>% 
+  mutate(
+    Indicator = "%age of labs exclusively using e-LIMS for data mgt",
+    `No.sites`  =  TotalSts
+  ) %>% 
+  rename(
+    "ReportedSites"    =  "sites",
+    "%age of sites"    =  "Pct_LIMS"
+  ) %>% 
+  select(Indicator, No.sites, ReportedSites, `%age of sites`)
+
+
+
+#### Report - LIMS category used by RRH #### 
+# First: Summary of LIMS type by RRH
+rrhlims <- ME %>%
+  filter(Yr == "2026") %>% 
+  group_by(`Type of LIMS used in facility`, RRH) %>%
+  summarise(sites = n(), .groups = "drop")
+
+# Second: Distinct facility count per RRH
+rrh_sites <- ME %>%
+  filter(Yr == "2026") %>%
+  group_by(RRH) %>%
+  summarise(No.sites = n_distinct(HFacility), .groups = "drop")
+
+# Combine both using left_join
+rrhlims_final <- left_join(rrhlims, rrh_sites, by = "RRH")
+
+#### re arrange the data frame
+rrhlims_finalPvt  <-  rrhlims_final %>% 
+  pivot_wider(
+    names_from = `Type of LIMS used in facility`,
+    values_from = sites
+  ) %>% 
+  mutate(
+    Pcte_LIMS  = paste0(
+      round((`e-LIMS` / No.sites) * 100, 0), "% (",
+      `e-LIMS`, "/", No.sites, ")"
+    ), 
+    
+    PctHard_Copy  = paste0(
+      round((`Hard-Copy` / No.sites) * 100, 0), "% (",
+      `Hard-Copy`, "/", No.sites, ")"
+    ), 
+    
+    Pctmixed = paste0(
+      round((`Mixed of both` / No.sites) * 100, 0), "% (",
+      `Mixed of both`, "/", No.sites, ")"
+    )) %>% 
+      select(RRH, Pcte_LIMS, PctHard_Copy, Pctmixed)
+
+#### Report - lab registers available ####
+labreg   <-  ME %>% 
+  filter(Yr == "2026") %>% 
+  rename("reg_status"  = "If hard copy, or mixed, does the  facility posses all the required lab registers") %>% 
+  filter(`Type of LIMS used in facility` %in% c("Hard-Copy","Mixed of both")) %>% 
+  filter(!is.na(reg_status))%>% 
+      summarise(
+        No.sites =  n_distinct(HFacility),
+        allreg = sum(reg_status == "Y"),
+        partial = sum(reg_status %in% c("P", "N"), na.rm = TRUE)
+        ) %>% 
+      mutate(
+        Indicator  =  "%age of sites not exclusively using e-LIMS with all lab registers in place",
+        `%age of sites`  =  round((allreg/No.sites)*100,0)
+      ) %>% 
+      rename("ReportedSites"  = "allreg") %>% 
+    select(Indicator, No.sites, ReportedSites, `%age of sites`)
+
+#### Report - lab registers available by RRH ####
+rrhlabreg   <-  ME %>% 
+  filter(Yr == "2026") %>% 
+  rename("reg_status"  = "If hard copy, or mixed, does the  facility posses all the required lab registers") %>% 
+  filter(`Type of LIMS used in facility` %in% c("Hard-Copy","Mixed of both")) %>% 
+  filter(!is.na(reg_status))%>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.sites =  n_distinct(HFacility),
+    allreg = sum(reg_status == "Y"),
+    partial = sum(reg_status %in% c("P", "N"), na.rm = TRUE)
+  ) %>% 
+  mutate(
+    `%age of sites not exlusively using e-LIMS with all required registers`  =  round((allreg/No.sites)*100,0)
+  ) 
+
+#### Report - Missing registers ####
+regsdt   <-  ME %>%
+  filter(Yr == "2026") %>% 
+  separate_rows(`Indicate the number and list the missing registers`, 
+                sep = ",|\\.| AND ")
+#### trim the names
+regsdt$`Indicate the number and list the missing registers`<-
+  trimws(regsdt$`Indicate the number and list the missing registers`
+  )
+
+#### Cleaning the equipment names
+regsdt  <-   regsdt %>% 
+  mutate(`Indicate the number and list the missing registers` = recode(`Indicate the number and list the missing registers`,
+       # old                    # New
+       "1, HMIS UBTS 003"  =  "HMIS UBTS 003",                                                                         
+       "2 (General Lab register, Accession register)" =  "DAILY ACTIVITY REGISTER",
+       "2 (General Lab register, Accession register)" =   "LABORATORY SPECIMEN RECEPTION REGISTER (HMIS 002)",
+       "No missing register"    =   "NONE",                                                                                       
+       "All registers available"  =   "NONE",                                                                                 
+       "Sample accession register missing (HMIS 002)" = "LABORATORY SPECIMEN RECEPTION REGISTER (HMIS 002)",   
+       "Blood transfusion registers"    =  "HMIS UBTS 003",                
+       "3- Sample accession Register"  = "LABORATORY SPECIMEN RECEPTION REGISTER (HMIS 002)",                      
+       "General Hospital Laboratory Register"    =  "DAILY ACTIVITY REGISTER",         
+       "Rejection Register Improvised"      =   "INDICATED A NONE EXISTANT REGISTER",                 
+       "Hematological indices register (HMIS 094)" =  "DAILY ACTIVITY HAEMATOLOGY REGISTER (HMIS LAB 014)",        
+       "Haematology register (HMIS 014)"   =  "DAILY ACTIVITY HAEMATOLOGY REGISTER (HMIS LAB 014)",                  
+       "Clinical Chemistry register (HMIS 090)"  =   "DAILY ACTIVITY CHEMISTRY REGISTER (HMIS LAB 012)",        
+       "not applicable"   =  "NONE",                                  
+       "TB and blood transfusion registers"     =  "HMIS UBTS 003",            
+       "NIL"    =   "NONE",                                              
+       "HPV register missing"  =  "DAILY ACTIVITY REGISTER FOR VIRAL LOAD, AHD, HPV (HMIS LAB 015)",                          
+       "HIMS LAB 014"      =  "DAILY ACTIVITY REGISTER",                                  
+       "009"   =  "DAILY ACTIVITY REGISTER (HMIS LAB 009)",                                             
+        "008"   =  "MICROBIOLOGY HOSPITAL LABORATORY REGISTER (HMIS LAB 008)",                                             
+        "007"    =  "MICROBIOLOGY LABORATORY TEST REQUEST FORM (HMIS LAB 007)",                                              
+        "006"     =  "GENERAL LABORATORY SPECIMEN REFERRAL FORM (HMIS LAB 006)",  
+        "1 sample reception and rejection register" =  "LABORATORY SPECIMEN RECEPTION REGISTER (HMIS 002)",          
+        "02 registers"   =  "LABORATORY SPECIMEN RECEPTION REGISTER (HMIS 002)",                                     
+        "Sample reception register"  = "LABORATORY SPECIMEN RECEPTION REGISTER (HMIS 002)",                         
+        "sample rejection register"  = "LABORATORY SPECIMEN RECEPTION REGISTER (HMIS 002)",                          
+         "03 registers"  =  "NOT SPECIFIED",                                   
+        "Lab daily activity registers for general hospital"  =  "DAILY ACTIVITY REGISTER",
+        "sample reception and rejection registers"  = "LABORATORY SPECIMEN RECEPTION REGISTER (HMIS 002)",      
+         "Lab Reception Register"    =   "LABORATORY SPECIMEN RECEPTION REGISTER (HMIS 002)",
+       "2 (General Lab register" = "DAILY ACTIVITY REGISTER",
+       "Accession register)"    =  "LABORATORY SPECIMEN RECEPTION REGISTER (HMIS 002)"
+         ))
+
+#### Report - no. of sites missing the indicated registers ####
+regsdtdt  <-   regsdt %>%
+  filter(Yr == "2026") %>% 
+  filter(`Indicate the number and list the missing registers` != "NONE") %>% 
+  group_by(`Indicate the number and list the missing registers`) %>% 
+  summarise(
+    No.missingRegs  =   n()
+    ) %>% 
+  arrange(desc(No.missingRegs)) %>% 
+  filter(!`Indicate the number and list the missing registers` %in%
+  c(NA,"","NA","N/A","1","A","N","n","a","00", "Non")) %>% 
+  rename(
+    "Missing Register"   =  "Indicate the number and list the missing registers"
+  )
+
+#### Report - Missing registers by RRH ####
+RRHregsdtdt  <-   regsdt %>%
+  filter(Yr == "2026") %>% 
+  filter(`Indicate the number and list the missing registers` != "NONE") %>% 
+  group_by(RRH,`Indicate the number and list the missing registers`) %>% 
+  summarise(
+    No.missingRegs  =   n(),
+    .groups = "drop"
+  ) %>% 
+  filter(!`Indicate the number and list the missing registers` %in%
+            c(NA,"","NA","N/A","1","A","N","n","a","00", "Non"))%>% 
+  rename(
+    "Missing Register"   =  "Indicate the number and list the missing registers"
+  )
+
+
+#### Report - DQA ####
+dqa   <-  ME %>% 
+  filter(Yr  ==  "2026") %>% 
+    summarise(
+    No.sites =  n_distinct(HFacility),
+    No.DQA   =  sum(`A Data Quality Assessment has been performed at least once in the 12 months preceding this visit`  ==  "Y", na.rm = TRUE),
+    ) %>% 
+  mutate(
+    Indicator  =  "%age of labs that performed at least one DQA in 12 months prior to the supervision visit",
+    `%age of sites`  =  round((No.DQA/No.sites)*100,0)
+  ) %>% 
+  rename("ReportedSites"  = "No.DQA") %>% 
+  select(Indicator, No.sites, ReportedSites, `%age of sites`)
+
+
+#### Report - CQI ####
+cqi   <-  ME %>% 
+  filter(Yr  ==  "2026") %>% 
+  summarise(
+    No.sites =  n_distinct(HFacility),
+    No.CQI   =  sum(`The facility is implementing at least one Continuous Quality Improvement (CQI) Project for poorly performing performance indicators` == "Y", na.rm = TRUE),
+  ) %>% 
+  mutate(
+    Indicator  =  "%age of labs that performed a CQI on poorly performing KPI in 12 months prior to the supervision visit",
+    `%age of sites`  =  round((No.CQI/No.sites)*100,0)
+  ) %>% 
+  rename("ReportedSites"  = "No.CQI") %>% 
+  select(Indicator, No.sites, ReportedSites, `%age of sites`)
+
+#### Report - DQA and CQI by RRH ####
+RRHdqa   <-  ME %>% 
+  filter(Yr  ==  "2026") %>%
+  group_by(RRH) %>% 
+  summarise(
+    No.DQA   =  sum(`A Data Quality Assessment has been performed at least once in the 12 months preceding this visit`  ==  "Y", na.rm = TRUE),
+    No.CQI   =  sum(`The facility is implementing at least one Continuous Quality Improvement (CQI) Project for poorly performing performance indicators` == "Y", na.rm = TRUE)
+  ) 
+
+# Combine both using left_join
+RRHdqa_final <- left_join(RRHdqa, rrh_sites, by = "RRH") %>% 
+  select("RRH","No.sites","No.DQA","No.CQI") %>% 
+  mutate(
+    `% labs that performed a DQA in 12 months prior to supervision visit` =  paste0(
+      round((No.DQA / No.sites) * 100, 0), "% (",
+      No.DQA, "/", No.sites, ")"
+    ), 
+    
+    `% labs that performed a CQI on poorly performing KPI(s) in 12 months prior to supervision visit` =  paste0(
+      round((No.CQI / No.sites) * 100, 0), "% (",
+      No.CQI, "/", No.sites, ")"
+    )) %>% 
+      select(RRH, 
+             `% labs that performed a DQA in 12 months prior to supervision visit`,                            
+             `% labs that performed a CQI on poorly performing KPI(s) in 12 months prior to supervision visit`
+             )
+
+
+#### Report - Line list of facilities with ME input ####
+me_hfDetail   <-  ME %>% 
+  select(RRH, District, HFacility,LEVEL,VDate, Yr, Qtr,
+         `Type of LIMS used in facility`,
+         `If hard copy, or mixed, does the  facility posses all the required lab registers`,
+         `Indicate the number and list the missing registers`,
+         `A Data Quality Assessment has been performed at least once in the 12 months preceding this visit`,
+         `The facility shares HMIS monthly and quarterly reports within TAT`,
+         `The facility is implementing at least one Continuous Quality Improvement (CQI) Project for poorly performing performance indicators`
+         )
+
+#### Report - M&E Action Tracker ####
+#### step 1
+MEtracker1 <-   ME %>% 
+  select(RRH,District, HFacility,VDate,20:23)
+# rename column names
+colnames(MEtracker1) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                             "Agreed Action Point", "Institution Responsible", 
+                             "Timelines")
+
+#### step 2
+MEtracker2 <-   ME %>% 
+  select(RRH,District, HFacility,VDate,25:28)
+# rename column names
+colnames(MEtracker2) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                             "Agreed Action Point", "Institution Responsible", 
+                             "Timelines")
+
+#### step 3
+MEtracker3 <-   ME %>% 
+  select(RRH,District, HFacility,VDate,30:33)
+# rename column names
+colnames(MEtracker3) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                             "Agreed Action Point", "Institution Responsible", 
+                             "Timelines")
+
+#### step 4
+MEtracker4 <-   ME %>% 
+  select(RRH,District, HFacility,VDate,35:38)
+# rename column names
+colnames(MEtracker4) <- c("RRH", "District", "HFacility","VDate", "Identified Gap",
+                             "Agreed Action Point", "Institution Responsible", 
+                             "Timelines")
+
+#### step 5
+MEtracker5 <-   ME %>% 
+  select(RRH,District, HFacility,VDate,40:43)
+# rename column names
+colnames(MEtracker5) <- c("RRH", "District", "HFacility","VDate", "Identified Gap",
+                             "Agreed Action Point", "Institution Responsible", 
+                             "Timelines")
+
+
+
+#### combine the data frames
+
+MEtrackerRpt <- rbind(MEtracker1, MEtracker2, MEtracker3, MEtracker4, MEtracker5
+)
+
+#### filter rows without gaps
+MEtrackerRpt1   <-  MEtrackerRpt %>% 
+  filter(!is.na(`Identified Gap`)) %>% 
+  arrange(RRH,District,HFacility)%>% 
+  mutate(
+    Section = "M_E"
+  )
+
+#### clean the Timelines, using "clean_deadlines" function
+MEtrackerRpt1   <-  MEtrackerRpt1 %>% 
+  mutate(
+    VDate_date = as.Date(VDate),
+    due_date = do.call(
+      c,
+      map2(
+        Timelines, VDate_date,
+        ~ clean_deadlines(.x, ref_date = .y, month_deadline = "last_day")$due_date
+      )
+    ),
+    ActionMonth = month(due_date, label = TRUE, abbr = TRUE),
+    ActionYr    = year(due_date)
+  )
+
+
+#### the table
+tble_MEtrackerRpt1  <-   flextable(MEtrackerRpt1)
+
+#### format the table
+tble_MEtrackerRpt1  <-  tble_MEtrackerRpt1 %>% 
+  theme_vanilla() %>%  # Optional: Apply a minimal theme
+  fontsize(size = 9, part = "all") %>%  # Reduce font size
+  line_spacing(space = 1.0) %>%  # Minimize row spacing
+  padding(padding = 2, part = "all") %>%  # Reduce padding
+  width(j = c("Identified Gap", "Agreed Action Point", "Institution Responsible"), width = 6
+  )  # Adjust column width
+
+
+tble_MEtrackerRpt1  <-  tble_MEtrackerRpt1 %>% 
+  vline(j=c(1,2,3,4,5,6,7), part = "all")
+# Display the table
+
+tble_MEtrackerRpt1  <-  tble_MEtrackerRpt1 %>% 
+  add_header_row(values = "M&E action tracker",
+                 colwidths = ncol(MEtrackerRpt1))
+
+tble_MEtrackerRpt1
+
+#######################################################################
+#######################################################################
+#### ICT  ####
+ICT  <-  SSW %>% 
+  select(District,HFacility,LEVEL,VDate,290:321,404:408)
+
+#### Report - sites with functional e-LIMS ####
+ICTftl   <-   ICT %>% 
+  filter(Yr == "2026") %>% 
+    summarise(
+    No.sites   =  n_distinct(HFacility), 
+    fntalICT   =  sum(`The facility possesses a functional lab e-LIMS (ALIS) - with the required infrastructure, computer, internet bundles, Power Back up` == "Y"),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    Indicator = "%age of labs with functinal LIMS (soft and hard infrastruture)",
+    Pct_sites  =  round((fntalICT/No.sites)*100,0)
+  ) %>% 
+  rename(
+    "ReportedSites"    =  "fntalICT",
+    "%age of sites"    =  "Pct_sites"
+  ) %>% 
+  select(Indicator, No.sites, ReportedSites, `%age of sites`)
+
+
+#### Report ICT functionality by RRH ####
+rrhICTftl   <-   ICT %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>%  
+  summarise(
+    No.sites   =  n_distinct(HFacility), 
+    fntalICT   =  sum(`The facility possesses a functional lab e-LIMS (ALIS) - with the required infrastructure, computer, internet bundles, Power Back up` == "Y"),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    Pct_sites  =  round((fntalICT/No.sites)*100,0)
+  ) %>% 
+  rename(
+    "No. of labs visited"   =  "No.sites",
+    "No. of labs with functional e-LIMS (soft and hard infrastruture)"  =  "fntalICT",
+    "% of labs with with functional e-LIMS (soft and hard infrastruture"  = "Pct_sites"
+  )
+    
+#### Report - sites fully transferred to electronic data management ####
+ICTtrans   <-   ICT %>% 
+  filter(Yr == "2026") %>% 
+  rename("Exclusive_e_dataMgt"  =  "The facility has fully transferred to electronic data management, using e-LIMS for among others, monthly, and quarterly HMIS reporting") %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility), 
+    edatamgt   =  sum(Exclusive_e_dataMgt == "Y"),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    Indicator = "%age of labs that have completely transfered to e-data mgt for data collection and reporting",
+    Pct_sites  =  round((edatamgt/No.sites)*100,0)
+  ) %>% 
+  rename(
+    "ReportedSites"    =  "edatamgt",
+    "%age of sites"    =  "Pct_sites"
+  ) %>% 
+  select(Indicator, No.sites, ReportedSites, `%age of sites`)
+
+
+#### Report sites fully transferred to electronic data management by RRH ####
+rrhICTtrans   <-   ICT %>% 
+  filter(Yr == "2026") %>% 
+  rename("Exclusive_e_dataMgt"  =  "The facility has fully transferred to electronic data management, using e-LIMS for among others, monthly, and quarterly HMIS reporting") %>% 
+  group_by(RRH) %>% 
+    summarise(
+      No.sites   =  n_distinct(HFacility),
+      No.fully   =  sum(Exclusive_e_dataMgt == "Y"),
+      No.Partial =  sum(Exclusive_e_dataMgt == "P"),
+      No.notTransfer =  sum(Exclusive_e_dataMgt == "N"),
+      .groups = "drop"
+  ) %>% 
+  mutate(
+    `%age labs completely transfered to e-data management` =  paste0(
+      round((No.fully / No.sites) * 100, 0), "% (",
+      No.fully, "/", No.sites, ")"
+    ), 
+    
+    `% labs that have partially transferred to e-data management` =  paste0(
+      round((No.Partial / No.sites) * 100, 0), "% (",
+      No.Partial, "/", No.sites, ")"
+      ),
+      
+    `% labs that have not transferred to e-data management` =  paste0(
+        round((No.notTransfer / No.sites) * 100, 0), "% (",
+        No.notTransfer, "/", No.sites, ")"
+    )) %>% 
+  select(RRH, 
+         `%age labs completely transfered to e-data management`,                            
+         `% labs that have partially transferred to e-data management`,
+         `% labs that have not transferred to e-data management`
+      )
+
+#### Report - sites EMR functional ####
+ICTEMR   <-   ICT %>% 
+  filter(Yr == "2026") %>% 
+  rename("functinal_EMR"  =  "If the facility is an EMR site, the facility is implementing Health Information Exchange (HIE) - VL request and results made and returned to EMR sites, respectively") %>% 
+    summarise(
+    No.sites   =  n_distinct(HFacility), 
+    fntlEMR   =  sum(functinal_EMR == "Y"),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    Indicator = "%age of EMR sites effectively performing Health Information Exchange (HIE)",
+    Pct_sites  =  round((fntlEMR/No.sites)*100,0)
+  ) %>% 
+  rename(
+    "ReportedSites"    =  "fntlEMR",
+    "%age of sites"    =  "Pct_sites"
+  ) %>% 
+  select(Indicator, No.sites, ReportedSites, `%age of sites`)
+
+#### Report sites EMR  by RRH ####
+rrhICTEMR   <-   ICT %>% 
+  filter(Yr == "2026") %>% 
+  rename("functinal_EMR"  =  "If the facility is an EMR site, the facility is implementing Health Information Exchange (HIE) - VL request and results made and returned to EMR sites, respectively") %>% 
+  group_by(RRH) %>% 
+    summarise(
+     No.sites   =  n_distinct(HFacility), 
+      fntlEMR   =  sum(functinal_EMR == "Y"),
+      NotfuntlEMR = sum(functinal_EMR == "N"),
+      Sometimes_funtlEMR = sum(functinal_EMR == "Sometime"),
+      .groups = "drop"
+  )%>% 
+  mutate(
+    `%age labs with functinal EMRs (e.g., Sending VL data requests)` =  paste0(
+      round((fntlEMR / No.sites) * 100, 0), "% (",
+      fntlEMR, "/", No.sites, ")"
+    ), 
+    
+    `%age labs with none functional EMRs` =  paste0(
+      round((NotfuntlEMR / No.sites) * 100, 0), "% (",
+      NotfuntlEMR, "/", No.sites, ")"
+    ),
+    
+    `%age labs with inconsistently functional EMRs` =  paste0(
+      round((Sometimes_funtlEMR / No.sites) * 100, 0), "% (",
+      Sometimes_funtlEMR, "/", No.sites, ")"
+    )) %>% 
+  select(RRH, 
+         `%age labs with functinal EMRs (e.g., Sending VL data requests)`,                            
+         `%age labs with none functional EMRs`,
+         `%age labs with inconsistently functional EMRs`
+      )
+
+#### Report - ICT detail ####
+ictdeail  <-  ICT %>% 
+  select(
+    RRH, District, HFacility, LEVEL, Yr, Qtr, 
+    `The facility possesses a functional lab e-LIMS (ALIS) - with the required infrastructure, computer, internet bundles, Power Back up`,
+    `The facility has fully transferred to electronic data management, using e-LIMS for among others, monthly, and quarterly HMIS reporting`,
+    `If the facility is an EMR site, the facility is implementing Health Information Exchange (HIE) - VL request and results made and returned to EMR sites, respectively`,
+    `Timely (at least once a week if not automated), automated data connectivity implemented`
+      )
+
+#### Report - ICT Action Point tracker ####
+#### step 1
+ICTTracker1 <-   ICT %>% 
+  select(RRH,District, HFacility,VDate, 19:22)
+# rename column names
+colnames(ICTTracker1) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### step 2
+ICTTracker2 <-   ME %>% 
+  select(RRH,District, HFacility,VDate,24:27)
+# rename column names
+colnames(ICTTracker2) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### step 3
+ICTTracker3 <-   ME %>% 
+  select(RRH,District, HFacility,VDate,29:32)
+# rename column names
+colnames(ICTTracker3) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### step 4
+ICTTracker4 <-   ME %>% 
+  select(RRH,District, HFacility,VDate,34:37)
+# rename column names
+colnames(ICTTracker4) <- c("RRH", "District", "HFacility","VDate", "Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+
+
+
+#### combine the data frames
+
+ICTTrackerRpt <- rbind(ICTTracker1, ICTTracker2, ICTTracker3, ICTTracker4
+)
+
+#### filter rows without gaps
+ICTTrackerRpt1   <-  ICTTrackerRpt %>% 
+  filter(!is.na(`Identified Gap`)) %>% 
+  arrange(RRH,District,HFacility)%>% 
+  mutate(
+    Section = "ICT"
+  )
+
+#### clean the Timelines, using "clean_deadlines" function
+ICTTrackerRpt1   <-  ICTTrackerRpt1 %>% 
+  mutate(
+    VDate_date = as.Date(VDate),
+    due_date = do.call(
+      c,
+      map2(
+        Timelines, VDate_date,
+        ~ clean_deadlines(.x, ref_date = .y, month_deadline = "last_day")$due_date
+      )
+    ),
+    ActionMonth = month(due_date, label = TRUE, abbr = TRUE),
+    ActionYr    = year(due_date)
+  )
+
+
+
+
+#### the table
+tble_ICTTrackerRpt1  <-   flextable(ICTTrackerRpt1)
+
+#### format the table
+tble_ICTTrackerRpt1  <-  tble_ICTTrackerRpt1 %>% 
+  theme_vanilla() %>%  # Optional: Apply a minimal theme
+  fontsize(size = 9, part = "all") %>%  # Reduce font size
+  line_spacing(space = 1.0) %>%  # Minimize row spacing
+  padding(padding = 2, part = "all") %>%  # Reduce padding
+  width(j = c("Identified Gap", "Agreed Action Point", "Institution Responsible"), width = 6
+  )  # Adjust column width
+
+
+tble_ICTTrackerRpt1  <-  tble_ICTTrackerRpt1 %>% 
+  vline(j=c(1,2,3,4,5,6,7), part = "all")
+# Display the table
+
+tble_ICTTrackerRpt1  <-  tble_ICTTrackerRpt1 %>% 
+  add_header_row(values = "ICT action tracker",
+                 colwidths = ncol(ICTTrackerRpt1))
+
+tble_ICTTrackerRpt1
+
+#################################################################
+#################################################################
+#### Micro Biology and AMR ####
+MBAmR <-  SSW %>% 
+  select(District,HFacility,LEVEL,VDate,322:355,404:408)
+
+#### Report - Staff performing microbiology lab tests, and AMR surveillance are trained ####
+mbamrdf  <- MBAmR %>% 
+  filter(Yr == "2026") %>% 
+  rename(
+    "MB_staff_trained"  =  "Staff performing microbiology lab tests, and AMR surveillance are trained, and are subjected to competence assessments") %>% 
+   summarise(
+    No.sites   =  n_distinct(HFacility), 
+    mbtrained   =  sum(MB_staff_trained == "Y"),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    Indicator = "%age of labs Staff performing microbiology lab tests, and AMR surveillance are trained, and are subjected to competence assessments",
+    Pct_sites  =  round((mbtrained/No.sites)*100,0)
+  ) %>% 
+  rename(
+    "ReportedSites"    =  "mbtrained",
+    "%age of sites"    =  "Pct_sites"
+  ) %>% 
+  select(Indicator, No.sites, ReportedSites, `%age of sites`)
+
+#### Report - RRH Staff performing microbiology lab tests, and AMR surveillance are trained ####
+RRHmbamrdf  <- MBAmR %>%
+  rename(
+    "MB_staff_trained"  =  "Staff performing microbiology lab tests, and AMR surveillance are trained, and are subjected to competence assessments") %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>% 
+    summarise(
+      No.sites   =  n_distinct(HFacility), 
+      Allstaff   =  sum(MB_staff_trained == "Y"),
+      No_staff = sum(MB_staff_trained == "N"),
+      Not_all = sum(MB_staff_trained == "Not ALL"),
+      .groups = "drop"
+      )%>% 
+  mutate(
+    `%age labs with all MB staff trained` =  paste0(
+      round((Allstaff / No.sites) * 100, 0), "% (",
+      Allstaff, "/", No.sites, ")"
+    ), 
+    
+    `%age labs with No MB staff trained` =  paste0(
+      round((No_staff / No.sites) * 100, 0), "% (",
+      No_staff, "/", No.sites, ")"
+    ),
+    
+    `%age labs with some staff trained` =  paste0(
+      round((Not_all / No.sites) * 100, 0), "% (",
+      Not_all, "/", No.sites, ")"
+    )) %>% 
+  select(RRH, 
+         `%age labs with all MB staff trained`,                            
+         `%age labs with No MB staff trained`,
+         `%age labs with some staff trained`
+        )
+
+#### Report - Microbiology details ####
+mbdetail  <-  MBAmR %>% 
+  select(
+    RRH, District, HFacility, LEVEL, VDate, Yr,
+    `Staff performing microbiology lab tests, and AMR surveillance are trained, and are subjected to competence assessments`
+  )
+
+#### Report - AMR, MB action tracker ####
+
+#### step 1
+MBTracker1 <-   MBAmR %>% 
+  select(RRH,District, HFacility,VDate, 16:19)
+# rename column names
+colnames(MBTracker1) <- c("RRH", "District", "HFacility","VDate", "Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### step 2
+MBTracker2 <-   MBAmR %>% 
+  select(RRH,District, HFacility,VDate,21:24)
+# rename column names
+colnames(MBTracker2) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### step 3
+MBTracker3 <-   MBAmR %>% 
+  select(RRH,District, HFacility,VDate,26:29)
+# rename column names
+colnames(MBTracker3) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### step 4
+MBTracker4 <-   MBAmR %>% 
+  select(RRH,District, HFacility,VDate,31:34)
+# rename column names
+colnames(MBTracker4) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### step 5
+MBTracker5 <-   MBAmR %>% 
+  select(RRH,District, HFacility,VDate,36:39)
+# rename column names
+colnames(MBTracker5) <- c("RRH", "District", "HFacility","VDate", "Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### combine the data frames
+
+MBTrackerRpt <- rbind(MBTracker1, MBTracker2, MBTracker3, MBTracker4, MBTracker5
+)
+
+#### filter rows without gaps
+MBTrackerRpt1   <-  MBTrackerRpt %>% 
+  filter(!is.na(`Identified Gap`)) %>% 
+  arrange(RRH,District,HFacility)%>% 
+  mutate(
+    Section = "MB_AMR"
+  )
+
+#### clean the Timelines, using "clean_deadlines" function
+MBTrackerRpt1   <-  MBTrackerRpt1 %>% 
+  mutate(
+    VDate_date = as.Date(VDate),
+    due_date = do.call(
+      c,
+      map2(
+        Timelines, VDate_date,
+        ~ clean_deadlines(.x, ref_date = .y, month_deadline = "last_day")$due_date
+      )
+    ),
+    ActionMonth = month(due_date, label = TRUE, abbr = TRUE),
+    ActionYr    = year(due_date)
+  )
+
+
+
+
+
+#### the table
+tble_MBTrackerRpt1  <-   flextable(MBTrackerRpt1)
+
+#### format the table
+tble_MBTrackerRpt1  <-  tble_MBTrackerRpt1 %>% 
+  theme_vanilla() %>%  # Optional: Apply a minimal theme
+  fontsize(size = 9, part = "all") %>%  # Reduce font size
+  line_spacing(space = 1.0) %>%  # Minimize row spacing
+  padding(padding = 2, part = "all") %>%  # Reduce padding
+  width(j = c("Identified Gap", "Agreed Action Point", "Institution Responsible"), width = 6
+  )  # Adjust column width
+
+
+tble_MBTrackerRpt1  <-  tble_MBTrackerRpt1 %>% 
+  vline(j=c(1,2,3,4,5,6,7), part = "all")
+# Display the table
+
+tble_MBTrackerRpt1  <-  tble_MBTrackerRpt1 %>% 
+  add_header_row(values = "Microbiology, AMR action tracker",
+                 colwidths = ncol(MBTrackerRpt1))
+
+tble_MBTrackerRpt1 
+
+####################################################################
+####################################################################
+#### Radiology ####
+radgy <-  SSW %>% 
+  select(District,HFacility,LEVEL,VDate,357:391,404:408)
+
+#### Report - Radiology equipment in place, and functional ####
+radgydf  <- radgy %>% 
+  filter(Yr == "2026") %>% 
+    rename(
+    "Radiology_Equipt_Fntl"  =  "Radiology equipment in place, and functional") %>% 
+    summarise(
+      No.sites   =  n_distinct(HFacility), 
+      Radgy_EquiptFntl   =  sum(Radiology_Equipt_Fntl == "Y"),
+      .groups = "drop"
+  ) %>% 
+  mutate(
+    Indicator = "%age of labs with functional radiology equipment",
+    Pct_sites  =  round((Radgy_EquiptFntl/No.sites)*100,0)
+  ) %>% 
+  rename(
+    "ReportedSites"    =  "Radgy_EquiptFntl",
+    "%age of sites"    =  "Pct_sites"
+  ) %>% 
+  select(Indicator, No.sites, ReportedSites, `%age of sites`)
+
+#### Report - Radiology equipment in place, functional by RRH ####
+rrhRadgydf  <- radgy %>% 
+  rename(
+    "Radiology_Equipt_Fntl"  =  "Radiology equipment in place, and functional") %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility), 
+    All_Equip_Fntl   =  sum(Radiology_Equipt_Fntl == "Y"),
+    NoEquipt_Functl = sum(Radiology_Equipt_Fntl == "N"),
+    SomeEquip_Fntl = sum(Radiology_Equipt_Fntl == "Not ALL"),
+    .groups = "drop"
+  )%>% 
+  mutate(
+    `%age labs with all Radiology equipment in place, and functional` =  paste0(
+      round((All_Equip_Fntl / No.sites) * 100, 0), "% (",
+      All_Equip_Fntl, "/", No.sites, ")"
+    ), 
+    
+    `%age labs with No Radiology equipment in place, and functional` =  paste0(
+      round((NoEquipt_Functl / No.sites) * 100, 0), "% (",
+      NoEquipt_Functl, "/", No.sites, ")"
+    ),
+    
+    `%age labs with some Radiology equipment in place, and functional` =  paste0(
+      round((SomeEquip_Fntl / No.sites) * 100, 0), "% (",
+      SomeEquip_Fntl, "/", No.sites, ")"
+    )) %>% 
+  select(RRH, 
+         `%age labs with all Radiology equipment in place, and functional`,                            
+         `%age labs with No Radiology equipment in place, and functional`,
+         `%age labs with some Radiology equipment in place, and functional`
+  )
+  
+#### report - Radiation protection functional ####
+radgydf11  <- radgy %>% 
+  filter(Yr == "2026") %>% 
+  rename(
+    "radiology_protection_fntl"  =  "Radiation protection functional (Gadget signage, warning lights, lead glasses, lead screens, lead aprons etc in place") %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility), 
+    Radgy_prtotnFntl   =  sum(radiology_protection_fntl == "Y", na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    Indicator = "%age of labs with available radiology protection gadgets, equipment",
+    Pct_sites  =  round((Radgy_prtotnFntl/No.sites)*100,0)
+  ) %>% 
+  rename(
+    "ReportedSites"    =  "Radgy_prtotnFntl",
+    "%age of sites"    =  "Pct_sites"
+  ) %>% 
+  select(Indicator, No.sites, ReportedSites, `%age of sites`)
+
+#### Report - Radiation protection functional by RRH ####
+rrhradgydf11  <- radgy %>% 
+  rename(
+    "radiology_protection_fntl"  =  "Radiation protection functional (Gadget signage, warning lights, lead glasses, lead screens, lead aprons etc in place") %>% 
+  filter(Yr == "2026") %>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility), 
+    All_Equip_Fntl   =  sum(radiology_protection_fntl == "Y"),
+    NoEquipt_Functl = sum(radiology_protection_fntl == "N"),
+    SomeEquip_Fntl = sum(radiology_protection_fntl == "Not ALL"),
+    .groups = "drop"
+  )%>% 
+  mutate(
+    `%age labs with all Radiology Protection equipment in place, and functional` =  paste0(
+      round((All_Equip_Fntl / No.sites) * 100, 0), "% (",
+      All_Equip_Fntl, "/", No.sites, ")"
+    ), 
+    
+    `%age labs with No Radiology Protection equipment in place, and functional` =  paste0(
+      round((NoEquipt_Functl / No.sites) * 100, 0), "% (",
+      NoEquipt_Functl, "/", No.sites, ")"
+    ),
+    
+    `%age labs with some Radiology Protection equipment in place, and functional` =  paste0(
+      round((SomeEquip_Fntl / No.sites) * 100, 0), "% (",
+      SomeEquip_Fntl, "/", No.sites, ")"
+    )) %>% 
+  select(RRH, 
+         `%age labs with all Radiology Protection equipment in place, and functional`,                            
+         `%age labs with No Radiology Protection equipment in place, and functional`,
+         `%age labs with some Radiology Protection equipment in place, and functional`
+  )
+  
+#### report - effective Radiology Quality assurance practices ####
+radgydf15  <- radgy %>% 
+  filter(Yr == "2026") %>% 
+  rename(
+    "FunctionalQMS"  =  "Effective Radiology Quality assurance practices in place (Light beam collination test,x-ray beam alignment test, safe light test, lead apron integrity test, etc)") %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility), 
+    RadioQMS   =  sum(FunctionalQMS == "Y", na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    Indicator = "%age of labs with effective Radiology Quality assurance practices in place, e.g., Light beam collination test,x-ray beam alignment test",
+    Pct_sites  =  round((RadioQMS/No.sites)*100,0)
+  ) %>% 
+  rename(
+    "ReportedSites"    =  "RadioQMS",
+    "%age of sites"    =  "Pct_sites"
+  ) %>% 
+  select(Indicator, No.sites, ReportedSites, `%age of sites`)
+
+#### Report - Radiation protection functional by RRH ####
+rrhradgydf15  <- radgy %>% 
+  filter(Yr == "2026") %>% 
+  rename(
+    "FunctionalQMS"  =  "Effective Radiology Quality assurance practices in place (Light beam collination test,x-ray beam alignment test, safe light test, lead apron integrity test, etc)") %>% 
+  group_by(RRH) %>% 
+  summarise(
+    No.sites   =  n_distinct(HFacility), 
+    All_sites   =  sum(FunctionalQMS == "Y", na.rm = TRUE),
+    Nosite = sum(FunctionalQMS == "N", na.rm = TRUE),
+    SomeSites = sum(FunctionalQMS == "Partial", na.rm = TRUE),
+    .groups = "drop"
+  )%>% 
+  mutate(
+    `%age labs with functional Quality Assurance Practices in Place` =  paste0(
+      round((All_sites / No.sites) * 100, 0), "% (",
+      All_sites, "/", No.sites, ")"
+    ), 
+    
+    `%age labs with No functional Quality Assurance Practices in Place` =  paste0(
+      round((Nosite / No.sites) * 100, 0), "% (",
+      Nosite, "/", No.sites, ")"
+    ),
+    
+    `%age labs with some functional Quality Assurance Practices in Place` =  paste0(
+      round((SomeSites / No.sites) * 100, 0), "% (",
+      SomeSites, "/", No.sites, ")"
+    )) %>% 
+  select(RRH, 
+         `%age labs with functional Quality Assurance Practices in Place`,                            
+         `%age labs with No functional Quality Assurance Practices in Place`,
+         `%age labs with some functional Quality Assurance Practices in Place`
+     )
+  
+  
+  
+  
+  
+  
+  filter(Yr == "2024") %>% 
+  group_by(RRH, `Effective Radiology Quality assurance practices in place (Light beam collination test,x-ray beam alignment test, safe light test, lead apron integrity test, etc)`) %>% 
+  summarise(
+    sites   =  n(), .groups = "drop"
+  )
+
+# Combine both using left_join
+rrhradgydf15_final <- left_join(rrhradgydf15, rrh_sites, by = "RRH")
+
+#### re arrange the data frame
+rrhradgydf15_finalPvt  <-  rrhradgydf15_final %>% 
+  pivot_wider(
+    names_from = `Effective Radiology Quality assurance practices in place (Light beam collination test,x-ray beam alignment test, safe light test, lead apron integrity test, etc)`,
+    values_from = sites
+  ) %>% 
+  select("RRH","No.sites","N","Y","Partial")
+
+#### the table
+tbl_rrhradgydf15_finalPvt  <-  flextable(rrhradgydf15_finalPvt)
+
+### format the table
+tbl_rrhradgydf15_finalPvt    <-   tbl_rrhradgydf15_finalPvt   %>% 
+  add_header_row(
+    values = c(
+      RRH   =  "RRH",
+      No.sites  =  "No. of sites visited in RRH region",
+      "No_sites_with_Radiology Quality assurance practices in place","",""  
+    )
+  )
+
+tbl_rrhradgydf15_finalPvt    <-   tbl_rrhradgydf15_finalPvt   %>% 
+  set_header_labels(
+    RRH  =   "RRH",
+    No.sites  =  "No. of sites visited in RRH region",
+    N   =   "None",
+    Y   =  "All",
+    Partial   =  "Some"
+  )
+
+#### merge column
+tbl_rrhradgydf15_finalPvt    <-   tbl_rrhradgydf15_finalPvt   %>% 
+  merge_at(i = 1, j=3:5, part = "header")  
+
+#### merge vertical columns
+tbl_rrhradgydf15_finalPvt    <-   tbl_rrhradgydf15_finalPvt   %>% 
+  merge_v(j=1, part = "header") %>% 
+  merge_v(j=2, part = "header")
+
+
+#### Add vertical lines
+tbl_rrhradgydf15_finalPvt    <-   tbl_rrhradgydf15_finalPvt   %>% 
+  vline(j=c(1,2,5), part = "all")
+
+#### the title
+tbl_rrhradgydf15_finalPvt    <-   tbl_rrhradgydf15_finalPvt   %>% 
+  add_header_row(values = "%age of sites with Radiology Quality assurance practices in place",
+                 colwidths = ncol(rrhradgydf15_finalPvt))
+
+tbl_rrhradgydf15_finalPvt
+
+
+#### Report - Radiology detail ####
+radiodetail  <- radgy %>% 
+  select(
+    RRH, District, HFacility, LEVEL, VDate, Yr,
+    `Radiology equipment in place, and functional`,
+    `Radiation protection functional (Gadget signage, warning lights, lead glasses, lead screens, lead aprons etc in place`,
+    `Effective Radiology Quality assurance practices in place (Light beam collination test,x-ray beam alignment test, safe light test, lead apron integrity test, etc)`
+  )
+
+#### radiology Action tracker ####
+#### step 1
+radioTracker1 <-   radgy %>% 
+  select(RRH,District, HFacility,VDate, 17:20)
+# rename column names
+colnames(radioTracker1) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### step 2
+radioTracker2 <-   MBAmR %>% 
+  select(RRH,District, HFacility,VDate,22:25)
+# rename column names
+colnames(radioTracker2) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### step 3
+radioTracker3 <-   MBAmR %>% 
+  select(RRH,District, HFacility,VDate,27:30)
+# rename column names
+colnames(radioTracker3) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### step 4
+radioTracker4 <-   MBAmR %>% 
+  select(RRH,District, HFacility,VDate,32:35)
+# rename column names
+colnames(radioTracker4) <- c("RRH", "District", "HFacility", "VDate","Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### step 5
+radioTracker5 <-   MBAmR %>% 
+  select(RRH,District, HFacility,VDate,37:40)
+# rename column names
+colnames(radioTracker5) <- c("RRH", "District", "HFacility","VDate", "Identified Gap",
+                          "Agreed Action Point", "Institution Responsible", 
+                          "Timelines")
+
+#### combine the data frames
+
+radioTrackerRpt <- rbind(radioTracker1, radioTracker2, radioTracker3, radioTracker4, radioTracker5
+)
+
+#### filter rows without gaps
+radioTrackerRpt1   <-  radioTrackerRpt %>% 
+  filter(!is.na(`Identified Gap`)) %>% 
+  arrange(RRH,District,HFacility)%>% 
+  mutate(
+    Section = "Radighy"
+  )
+
+#### clean the Timelines, using "clean_deadlines" function
+radioTrackerRpt1   <-  radioTrackerRpt1 %>% 
+  mutate(
+    VDate_date = as.Date(VDate),
+    due_date = do.call(
+      c,
+      map2(
+        Timelines, VDate_date,
+        ~ clean_deadlines(.x, ref_date = .y, month_deadline = "last_day")$due_date
+      )
+    ),
+    ActionMonth = month(due_date, label = TRUE, abbr = TRUE),
+    ActionYr    = year(due_date)
+  )
+
+
+
+
+
+#### the table
+tble_radioTrackerRpt1  <-   flextable(radioTrackerRpt1)
+
+#### format the table
+tble_radioTrackerRpt1  <-  tble_radioTrackerRpt1 %>% 
+  theme_vanilla() %>%  # Optional: Apply a minimal theme
+  fontsize(size = 9, part = "all") %>%  # Reduce font size
+  line_spacing(space = 1.0) %>%  # Minimize row spacing
+  padding(padding = 2, part = "all") %>%  # Reduce padding
+  width(j = c(4, 5), width = 6) %>%            # Increase width of columns 4 and 5
+  width(j = c("Identified Gap", "Agreed Action Point", "Institution Responsible"), width = 6
+  )  # Adjust column width
+
+
+tble_radioTrackerRpt1  <-  tble_radioTrackerRpt1 %>% 
+  vline(j=c(1,2,3,4,5,6,7), part = "all")
+# Display the table
+
+tble_radioTrackerRpt1  <-  tble_radioTrackerRpt1 %>% 
+  add_header_row(values = "radiology action tracker",
+                 colwidths = ncol(radioTrackerRpt1))
+
+tble_radioTrackerRpt1 
+
+
+#####################################################################
+#####################################################################
+#### Report - Overall Tracker ####
+
+actionTracker <- bind_rows(HRtrackerRpt1, sertrackerRpt1,
+                           equiptrackerRpt1, QMStrackerRpt1,
+                           nsrtntrackerRpt1, MEtrackerRpt1,
+                           ICTTrackerRpt1, MBTrackerRpt1,
+                           radioTrackerRpt1
+                           )  
+#### Report - Number of health facilities with Action Points ####
+
+hfactions  <-  actionTracker %>% 
+  filter(!is.na(ActionYr), ActionYr %in% c(2025, 2026)) %>% 
+  group_by(RRH, Section, ActionYr) %>% 
+    summarise(
+      N  =  n(),
+      .groups = "drop"
+    ) %>% 
+  arrange(RRH, desc(N))
+
+# re-organise the values
+hfactionsPvt  <-  hfactions %>% 
+  pivot_wider(
+    names_from = Section,
+    values_from = N
+  ) 
+#### data set for dashbaord
+ddashHfac  <-  actionTracker %>% 
+  select(RRH, District, HFacility, VDate,                  
+         `Identified Gap`,  `Agreed Action Point`,    
+         `Institution Responsible`, Section,            
+         ActionMonth, ActionYr)
+
+################################################################
+###############################################################
+#### Other observations, comments, notes and recommendation ####
+obser   <-  SSW %>% 
+  filter(!is.na(`Supervisor:  Other observations, comments, notes and recommendation`)) %>% 
+  filter(Yr == "2024") %>% 
+  select(RRH,District,HFacility,LEVEL,VDate,392) %>% 
+    arrange(RRH)
+
+#### the table
+tbl_obser   <-  flextable(obser)
+
+tbl_obser   <-  tbl_obser %>% 
+  add_header_row(values = "Supervisors general comments",
+                 colwidths = ncol(obser))
+
+
+tbl_obser
+
+########################################################################
+########################################################################
+##### The report ####
+# A header function
+make_header <- function(title) {
+  data.frame(
+    Indicator = title,
+    No.sites = NA,
+    ReportedSites = NA,
+    `%age of sites` = NA
+  )
+}
+# Bind the rows
+ssrport  <-  bind_rows(
+  make_header("HR"),
+  hroverall,cbuild, 
+  
+  make_header("Equipment"),
+  ovlnonFnl, equipSer, 
+  
+  make_header("QMS"),
+  QMSenroll, QMSaudit,  QMSscores, labtest_EQA,
+  
+  make_header("BSBS"),
+  brmAudit,brmwaste, brmincin, 
+  
+  make_header("NSRTN"),
+  Labsvits, Labbkserd, LabTAT,Lab_referTAT,Lab_rejtn,
+  
+  make_header("M&E"),
+  elims, labreg, dqa, cqi,
+  
+  make_header("ICT"),
+  ICTftl, ICTtrans, ICTEMR, 
+  
+  make_header("MicroBiology"),
+  mbamrdf, 
+  
+  make_header("Radiology"),
+  radgydf, radgydf11, radgydf15,
+  )
+
+# Ensuring indicator is the 1st column
+ssrport <- ssrport %>% 
+  select(Indicator, everything())
